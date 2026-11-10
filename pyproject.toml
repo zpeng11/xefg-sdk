@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xefg-sdk"
+version = "0.2.0"
+description = "Portable XeFG 2x ONNX exporter and capture-independent reference runtime"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE.md"]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+ort = ["onnxruntime>=1.20"]
+export = ["onnx>=1.16"]
+test = ["onnx>=1.16", "onnxruntime>=1.20"]
+
+[project.scripts]
+xefg-export = "xefg_sdk.export.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+xefg_sdk = ["py.typed"]

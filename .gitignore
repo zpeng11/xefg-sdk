@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.zcode/
+
+# Keep captured and generated model data outside the source repository.
+*.onnx
+*.bin
+*.dll
+*.npz
+*.npy
+*.whl
+*.zip
+captures/
+model_package/
+artifacts/
+
+# Optional native capture build products.
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.exe
+*.obj
+*.lib
+*.pdb
+*.ilk
+*.dxil
