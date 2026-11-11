@@ -27,6 +27,7 @@ struct SceneOptions
     // Move the crosshair per frame so the captured UI is not frame-invariant.
     // Off by default: every byte of the default scene stays unchanged.
     bool animateUi = false;
+    bool calibration = false; // Opaque frame-ID strip, separate from the motion ROI.
     // XeFG expects current -> previous; flip only for diagnosing sign conventions.
     bool flipMotionVectors = false;
     uint32_t frameIndex = 0;

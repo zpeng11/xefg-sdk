@@ -99,6 +99,39 @@ int main()
     Check(animatedUiA.uiColor != animatedUiB.uiColor, "animated UI differs across frames");
     Check(animatedUiA.backbuffer != animatedUiB.backbuffer, "animated backbuffer differs across frames");
 
+    uiOptions.animateUi = false;
+    uiOptions.staticScene = false;
+    uiOptions.calibration = true;
+    for (uint32_t id : {0u, 1u, 7u, 255u, 65535u})
+    {
+        uiOptions.frameIndex = id;
+        oracle::SceneFrame calibrated, repeated;
+        oracle::GenerateScene(uiOptions, calibrated);
+        oracle::GenerateScene(uiOptions, repeated);
+        Check(calibrated.backbuffer == repeated.backbuffer, "calibration is deterministic");
+        uint32_t decoded = 0;
+        for (uint32_t bit = 0; bit < 32; ++bit)
+        {
+            const size_t pixel = (36u * 640u + 100u + bit * 8u) * 4u;
+            Check(calibrated.uiColor[pixel + 3] == 255, "frame marker is opaque");
+            Check(calibrated.expectedMid[pixel] == calibrated.backbuffer[pixel],
+                "midpoint uses current UI marker");
+            decoded |= uint32_t(calibrated.backbuffer[pixel] > 128) << bit;
+        }
+        Check((decoded & 0xffffu) == id, "frame ID decodes");
+        Check((decoded >> 16) == (id ^ 0xffffu), "frame ID complement decodes");
+        uiOptions.calibration = false;
+        oracle::GenerateScene(uiOptions, repeated);
+        Check(calibrated.hudlessColor == repeated.hudlessColor, "marker preserves motion content");
+        Check(calibrated.motion == repeated.motion, "marker preserves motion vectors");
+        for (uint32_t y = 80; y < 300; ++y)
+            for (uint32_t x = 80; x < 560; ++x)
+                for (uint32_t c = 0; c < 4; ++c)
+                    Check(calibrated.backbuffer[(y * 640 + x) * 4 + c]
+                        == repeated.backbuffer[(y * 640 + x) * 4 + c], "marker excludes motion ROI");
+        uiOptions.calibration = true;
+    }
+
     const std::filesystem::path rawPath =
         std::filesystem::temp_directory_path() / "xefg_scene_write_test.bin";
     const uint8_t payload[4] = {0xde, 0xad, 0xbe, 0xef};

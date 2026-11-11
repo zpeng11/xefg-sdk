@@ -154,6 +154,14 @@ void RenderUi(const SceneOptions& options, std::vector<uint8_t>& output)
                 g = 255.0f;
                 b = 255.0f;
             }
+            if (options.calibration && y >= 32 && y < 40 && x >= 96 && x < 352)
+            {
+                const uint32_t id = options.frameIndex & 0xffffu;
+                const uint32_t code = id | ((id ^ 0xffffu) << 16);
+                const uint32_t bit = (x - 96) / 8;
+                r = g = b = (code & (1u << bit)) ? 255.0f : 0.0f;
+                alpha = 1.0f;
+            }
             if (alpha > 0.0f)
                 StoreBgra(&output[(static_cast<size_t>(y) * options.width + x) * 4],
                     r * alpha, g * alpha, b * alpha, alpha * 255.0f);

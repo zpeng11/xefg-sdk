@@ -1,0 +1,262 @@
+# Render validation
+
+Independent validation tools, outside the Python SDK package: capture official
+XeSS-FG output, establish calibration frame pairing, replay the same inputs
+through the public SDK, and measure pixel differences. Two inputs are supported:
+the original analytical probe scene and an independent DX12 raster-scene path.
+
+## Build and capture
+
+Build the current probe (Windows, Visual Studio 2022, XeSS SDK 3.0.2):
+
+```powershell
+cmake -S tools/capture -B D:/xefg-render-validation-build `
+  -G "Visual Studio 17 2022" -A x64 -DXESS_SDK_ROOT=C:/path/to/XeSS_SDK_3.0.2
+cmake --build D:/xefg-render-validation-build --config Release --parallel
+
+python -I -B tools/render-validation/validate.py capture `
+  --probe D:/xefg-render-validation-build/Release/XefgProbe.exe `
+  --xess-bin C:/path/to/XeSS_SDK_3.0.2/bin `
+  --out D:/xefg-validation/run-001 --frames 8
+```
+
+The inventory/capture commands use only the standard library. Pairing needs
+NumPy. Neither requires an installed `xefg_sdk`. Output must be a new directory;
+it never replaces an earlier run.
+The initial case is fixed at mode 3, 640x360, 320x180 motion/depth, four warmup
+frames, and the probe's deterministic moving scene. `--adapter` selects a GPU.
+Tensor snapshots and model-catalog dumps are off. The probe still records its
+existing dispatch/program trace; this is not a timing benchmark or an
+uninstrumented official sample.
+
+```text
+run-001/
+  invocation.json                  command and probe executable SHA-256
+  capture.log                      native stdout/stderr
+  capture/
+    presents.json                  native presents and official API statuses
+    captures/                      tightly packed output pixels
+    application_inputs/            inputs, including warmup, and manifest
+    trace/                         configuration, adapter, provider hash, trace
+    ...                            existing probe program/parameter artifacts
+  report/
+    report.json                    inventory, hashes, statuses, observed labels
+    report.md                      short summary
+```
+
+Inventory an existing run produced by the updated probe:
+
+```powershell
+python -I -B tools/render-validation/validate.py inspect `
+  --run D:/xefg-validation/run-001/capture `
+  --out D:/xefg-validation/report-001
+```
+
+Old captures without `presents.json` must be recaptured. The tool does not infer
+missing metadata from filenames.
+
+## What the report means
+
+`inventory_complete` means the inputs/presents exist with the expected byte
+sizes, frame records are consistent, interpolation-only debug mode was enabled,
+and measured official API statuses report success. Exit code is zero.
+`needs_attention` preserves the report with the status issues and exits one.
+Missing/corrupt files fail the command rather than producing a successful report.
+
+**Inventory success is not image-quality success.** Each present remains
+`classification: unassigned`, and `pairing` is `unverified`. An observed
+application-frame label is sampled by the native capture code; it is not a
+provider-confirmed source frame ID. Likewise, ordinal zero is not proof that an
+image is generated rather than a base/fallback frame. Warmup status is recorded
+but excluded from measured-status checks.
+
+### Native present manifest
+
+Current schema: `xefg.present_capture/2`; inventory also accepts v1.
+
+- `only_interpolation_requested`, `only_interpolation_result`: debug request and
+  its API result. When not requested, the result is zero but does not indicate
+  that the feature was enabled.
+- `capture_error`: native readback/file failure, or an empty string.
+- `frame_status`: application frame, HRESULT of proxy Present, status-query
+  result, `frames_presented`, and `frame_generation_result`.
+- `presents`: contiguous `sequence`, `observed_application_frame`, per-label
+  `ordinal`, dimensions, integer DXGI `format`, and run-relative pixel `file`.
+
+The manifest is written after XeFG context destruction. Capture remains enabled
+through shutdown so late native presents can be included. The cross-thread
+capture-enable/frame-label fields are atomic. This removes data races, not the
+need to establish semantic frame pairing.
+
+## Calibration and pairing
+
+Use `capture --calibration` for an opaque UI frame-ID strip and analytical
+midpoint references. The strip encodes a 16-bit application ID followed by its
+16-bit complement. It is outside the motion comparison ROI. Default captures
+remain unchanged. Add `--tag-interpolated --all-presents` for an official debug
+identity experiment; add `--reset-frame 7` for a history-reset control, or
+`--static` for a static control. `--pacing-ms` sets application pacing.
+
+```powershell
+python -I -B tools/render-validation/validate.py capture `
+  --probe D:/xefg-render-validation-build/Release/XefgProbe.exe `
+  --xess-bin C:/path/to/XeSS_SDK_3.0.2/bin `
+  --out D:/xefg-validation/calibration-001 --calibration
+python -I -B tools/render-validation/validate.py pair `
+  --run D:/xefg-validation/calibration-001/capture `
+  --out D:/xefg-validation/calibration-001/pairing
+```
+
+Calibration adds `calibration/manifest.json` and one raw analytical midpoint
+per input frame, including warmup. Pairing requires native present schema v2;
+inventory still accepts v1. V2 also records official debug flags/results,
+frame-generation enabled state, application/native QPC intervals and native
+DXGI present counts with their API results.
+
+Pairing decodes the UI strip, then ranks analytical midpoint and base-frame
+references in the motion ROI. A temporal candidate must agree with the decoded
+ID, stay within 4.0 reference MAE, and beat the runner-up by at least 0.5 MAE
+and 20%. The official purple tag detector checks the solid 48x48 corner patch
+observed for this provider. These are calibration-specific pairing criteria,
+not image-quality thresholds. Static scenes, tied candidates, duplicate generated
+outputs, and conflicting official status stay ambiguous. Observed application
+labels and timestamps do not determine pair identity. The JSON retains evidence
+and hashes; `paired` requires all expected measured generated frames and no
+ambiguous outputs. `incomplete` returns exit code one and retains the report.
+All-presents and reset experiments may produce an inventory `needs_attention`;
+this does not prevent running the separate pairing experiment.
+
+## Real DX12 scene path
+
+The independent native target lives under `native/`. Unlike the probe it uses
+only public XeSS-FG APIs: no decoder relay, dispatch trace or model extraction.
+It rasterizes indexed geometry, normal-Z depth and matrix-derived motion vectors.
+The same GPU resources tagged to FG are read back as application inputs.
+
+```powershell
+cmake -S tools/render-validation/native -B D:/xefg-render-validation-raster-build `
+  -G "Visual Studio 17 2022" -A x64 -DXESS_SDK_ROOT=C:/path/to/XeSS_SDK_3.0.2
+cmake --build D:/xefg-render-validation-raster-build --config Release --parallel
+python -I -B tools/render-validation/validate.py render `
+  --renderer D:/xefg-render-validation-raster-build/Release/XefgRenderValidation.exe `
+  --xess-bin C:/path/to/XeSS_SDK_3.0.2/bin --scene translation `
+  --out D:/xefg-validation/raster-001
+python -I -B tools/render-validation/validate.py pair `
+  --run D:/xefg-validation/raster-001/capture `
+  --out D:/xefg-validation/raster-001/pairing
+```
+
+Scenes: `translation`, `occlusion`, `camera`, `cut`. Output remains 640x360 mode 3
+with 320x180 geometry buffers. `render --render-only --warp` exercises rasterization
+without loading the FG runtime; hardware FG cannot run on WARP. Use `--debug`
+for D3D12 validation and `--no-tag` only for input/tag-layout control experiments.
+Validate dumped geometry resources without loading a model:
+
+```powershell
+python -I -B tools/render-validation/check_render_inputs.py `
+  --run D:/xefg-validation/raster-001/capture `
+  --out D:/xefg-validation/raster-001/input-check.json
+```
+
+This checks finite values, resource sizes and normal device-depth range. Native
+math/raster tests separately check projection and motion conventions.
+
+Raster runs use root `meta.json` and `scene.json` rather than fake trace metadata.
+`scene.json` records input submissions, transforms, resets, conventions and native
+midpoint references. The `pair` command selects `rendered_scene` from this manifest.
+Pairing v2 requires the official generated-frame tag and the decoded current UI
+ID, checks all input-submission API results and rejects duplicate/failed history.
+No analytical-image or SDK-output candidate ranking is used for raster scenes.
+
+The debug-layout profile is bound to the measured provider hash. Four corner
+boxes and two vertical lines must match, not just a few purple pixels. Quality
+comparison excludes those regions plus the frame-ID strip; complete images are
+still retained. Native midpoint images are quality references only and use current
+UI composition, not a simulated half-frame UI. They do not establish frame identity.
+
+Normal device depth and camera/object motion are new coverage beyond the old
+1/100-depth analytical scene. Neither depth nor motion is tuned to reduce output
+differences: actual GPU values go to both implementations.
+
+## SDK replay and comparison
+
+Install the checkout and replay dependencies into an isolated environment:
+
+```powershell
+python -m pip install -e ".[test]" pillow
+python -I -B tools/render-validation/validate.py replay `
+  --run D:/xefg-validation/calibration-001/capture `
+  --pairing D:/xefg-validation/calibration-001/pairing/pairing.json `
+  --package D:/path/to/model-package `
+  --out D:/xefg-validation/calibration-001/replay --all
+```
+
+Without `--all`, only the first verified generated pair is replayed. The tool
+requires a complete pairing report and rechecks its artifact hashes. Analytical
+calibration comparisons require untagged runs; rendered-scene v2 comparisons
+require official tags and exclude their recorded regions. It calls public `Xefg2xRuntime.prepare/interpolate_pair` with explicit mode
+3, previous/current hudless colors, and current UI/motion/depth. Reset frames are
+not interpolated. Warmup inputs remain available, but the stateless pair API does
+not require replaying every warmup frame.
+
+Each frame produces a BGRA NPY, official and SDK RGB PNGs, and an absolute RGB
+difference PNG at fixed 8x gain. Raster runs also save `_valid_diff_x8.png`
+with excluded debug-overlay pixels blacked out. `report.json` and `report.md` contain RGB MAE,
+maximum error, RMSE/PSNR, changed-pixel fractions and separate alpha statistics.
+Full-frame and `valid_region` metrics are both reported; the Markdown summary
+uses the valid region. Raster reports additionally compare SDK and official
+output separately against native midpoint references. Identical RGB
+uses `rgb_identical: true` and `rgb_psnr_db: null` (not nonstandard JSON Infinity).
+The report records model/profile hashes, input pairing hash, dependency versions,
+Git state and output hashes. `measured` means the comparison ran, not that a
+quality threshold passed. CPU wall times include first model loading and are not
+a real-time benchmark.
+
+Native capture copies the current backbuffer **before** native Present on the
+actual queue passed to the native swapchain factory. Using the application queue
+or copying after Present produced stale images in calibration; those failures
+and the corrected experiments are documented in [VALIDATION.md](VALIDATION.md).
+
+## Four-scene matrix
+
+Once the native target passes its render-only tests, run the fixed short matrix:
+
+```powershell
+python -I -B tools/render-validation/run_matrix.py `
+  --renderer D:/xefg-render-validation-raster-build/Release/XefgRenderValidation.exe `
+  --xess-bin C:/path/to/XeSS_SDK_3.0.2/bin `
+  --package D:/path/to/model-package --out D:/xefg-validation/matrix-001
+```
+
+Scenes run serially, not concurrently on the GPU. Each scene goes through render,
+input checks, pairing and full replay. A failed stage stops that scene and is
+recorded in `matrix.json`; other scenes still run. Reset-related inventory
+warnings may proceed to pairing, which decides whether all expected generated
+frames are accounted for. The matrix exit code is nonzero if any scene cannot
+finish replay. No raw artifacts are automatically deleted.
+
+## Artifact policy
+
+Keep runs and build products outside the checkout. Source, test fixtures made
+in temporary directories, and scenario definitions belong in Git; raw pixels,
+SDK binaries, models and run reports do not. The first stage keeps all public
+inputs and presents so pairing can be investigated; tensor dumps stay off.
+Hashes cover the report's input/output files and source manifests, not the
+entire dispatch/program trace. Later regression suites can retain failure windows
+instead of every raw frame.
+
+## Tests
+
+```powershell
+python -I -B -m unittest discover -s tools/render-validation/tests -v
+ctest --test-dir D:/xefg-render-validation-build -C Release --output-on-failure
+```
+
+## Next increments
+
+1. Expand scene coverage and add versioned mesh/material assets when procedural
+   geometry no longer exercises the behavior being investigated.
+2. Extend mode/resolution coverage and depth conventions one dimension at a time.
+3. Add performance measurements separately from synchronous validation readback.
+
+No third-party engine, model assets or SDK runtime binaries are vendored.

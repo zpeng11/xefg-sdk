@@ -22,6 +22,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -58,6 +59,9 @@ struct Options
     bool dumpInputs = false;
     uint32_t tensorBudgetMB = 512;
     uint32_t tensorDispatches = 0;
+    bool calibration = false;
+    bool tagInterpolated = false;
+    uint32_t resetFrame = 0;
 };
 
 std::wstring Widen(const std::string& text)
@@ -125,6 +129,9 @@ void Usage()
         "  --tensor-budget-mb N    tensor snapshot budget (default 512)\n"
         "  --tensor-dispatches N   snapshot only the first N traced dispatches\n"
         "  --all-presents          do not enable SHOW_ONLY_INTERPOLATION\n"
+        "  --calibration           frame marker + calibration manifest (640x360, mode 3, --dump-inputs)\n"
+        "  --tag-interpolated      enable TAG_INTERPOLATED_FRAMES debug feature\n"
+        "  --reset-frame N         set constants.resetHistory on frame N (default 0)\n"
         "  --no-model-dump         skip the model catalog dump\n"
         "  --debug                 enable the D3D12 debug layer\n");
 }
@@ -182,6 +189,9 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error)
         else if (argument == "--tensor-budget-mb") options.tensorBudgetMB = std::stoul(value(i, argument));
         else if (argument == "--tensor-dispatches") options.tensorDispatches = std::stoul(value(i, argument));
         else if (argument == "--all-presents") options.showInterpolationOnly = false;
+        else if (argument == "--calibration") options.calibration = true;
+        else if (argument == "--tag-interpolated") options.tagInterpolated = true;
+        else if (argument == "--reset-frame") options.resetFrame = std::stoul(value(i, argument));
         else if (argument == "--no-model-dump") options.modelDump = false;
         else if (argument == "--debug") options.debugLayer = true;
         else if (argument == "--velocity")
@@ -363,6 +373,91 @@ bool WriteApplicationInputsManifest(const std::filesystem::path& directory, cons
     return true;
 }
 
+struct CalibrationFrame
+{
+    uint32_t index = 0;
+    bool resetHistory = false;
+};
+
+bool WriteCalibrationManifest(const std::filesystem::path& directory,
+    const std::vector<CalibrationFrame>& frames, bool staticScene, std::string& error)
+{
+    const std::filesystem::path path = directory / L"manifest.json";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file)
+    {
+        error = "could not write calibration manifest " + path.string();
+        return false;
+    }
+    file << "{\n";
+    file << "  \"schema\": \"xefg.calibration/1\",\n";
+    file << "  \"static\": " << (staticScene ? "true" : "false") << ",\n";
+    file << "  \"marker\": {\"x\": 96, \"y\": 32, \"cell_width\": 8, \"cell_height\": 8, "
+            "\"bits\": 32, \"encoding\": \"u16-complement-lsb\", \"threshold\": 128},\n";
+    file << "  \"motion_roi\": [80, 80, 560, 300],\n";
+    file << "  \"frames\": [\n";
+    for (size_t i = 0; i < frames.size(); ++i)
+    {
+        char name[64]{};
+        std::snprintf(name, sizeof(name), "mid_%05u.bgra", frames[i].index);
+        file << "    {\"index\": " << frames[i].index
+             << ", \"reset_history\": " << (frames[i].resetHistory ? "true" : "false")
+             << ", \"midpoint\": \"" << name << "\""
+             << ", \"time\": " << std::fixed << std::setprecision(1)
+             << (static_cast<double>(frames[i].index) - 0.5)
+             << std::defaultfloat << std::setprecision(6) << "}"
+             << (i + 1 < frames.size() ? "," : "") << '\n';
+    }
+    file << "  ]\n}\n";
+    file.flush();
+    if (!file.good())
+    {
+        error = "could not write calibration manifest " + path.string();
+        return false;
+    }
+    return true;
+}
+
+bool WritePresentsManifest(const std::filesystem::path& directory, oracle::CaptureContext& capture,
+    bool interpolationOnly, int interpolationResult, bool tagInterpolated, int tagInterpolatedResult,
+    int64_t qpcFrequency, const std::vector<std::string>& statuses)
+{
+    const auto records = capture.Captures();
+    std::ofstream file(directory / L"presents.json", std::ios::binary | std::ios::trunc);
+    if (!file) return false;
+    file << "{\n  \"schema\": \"xefg.present_capture/2\",\n"
+         << "  \"only_interpolation_requested\": " << (interpolationOnly ? "true" : "false") << ",\n"
+         << "  \"only_interpolation_result\": " << interpolationResult << ",\n"
+         << "  \"tag_interpolated_requested\": " << (tagInterpolated ? "true" : "false") << ",\n"
+         << "  \"tag_interpolated_result\": " << tagInterpolatedResult << ",\n"
+         << "  \"qpc_frequency\": " << qpcFrequency << ",\n"
+         << "  \"capture_error\": \"" << probe::JsonEscape(capture.Error()) << "\",\n"
+         << "  \"frame_status\": [\n";
+    for (size_t i = 0; i < statuses.size(); ++i)
+        file << "    " << statuses[i] << (i + 1 < statuses.size() ? "," : "") << '\n';
+    file << "  ],\n  \"presents\": [\n";
+    for (size_t i = 0; i < records.size(); ++i)
+    {
+        const auto& record = records[i];
+        const auto relative = std::filesystem::path(record.file).lexically_relative(directory);
+        file << "    {\"sequence\": " << record.sequence
+             << ", \"observed_application_frame\": " << record.frameIndex
+             << ", \"ordinal\": " << record.ordinal
+             << ", \"width\": " << record.width << ", \"height\": " << record.height
+             << ", \"format\": " << int(record.format)
+             << ", \"file\": \"" << probe::JsonEscape(Narrow(relative.generic_wstring())) << "\""
+             << ", \"present_start_qpc\": " << record.presentStartQpc
+             << ", \"present_end_qpc\": " << record.presentEndQpc
+             << ", \"dxgi_present_count\": " << record.dxgiPresentCount
+             << ", \"dxgi_present_count_result\": " << record.dxgiPresentCountResult
+             << ", \"native_present_result\": " << record.nativePresentResult << "}"
+             << (i + 1 < records.size() ? "," : "") << '\n';
+    }
+    file << "  ]\n}\n";
+    file.close();
+    return bool(file);
+}
+
 void CALLBACK LogCallback(const char* message, xefg_swapchain_logging_level_t level, void* userData)
 {
     static_cast<oracle::Runtime*>(userData)->AppendLog(message, static_cast<int>(level));
@@ -373,6 +468,8 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
+    LARGE_INTEGER qpcFrequency{};
+    QueryPerformanceFrequency(&qpcFrequency);
     AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* info) -> LONG {
         if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION
             && info->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION
@@ -413,6 +510,18 @@ int main(int argc, char** argv)
         {
             std::fprintf(stderr, "application input directory unavailable: %s\n",
                 applicationInputsDirectory.string().c_str());
+            return 1;
+        }
+    }
+
+    const std::filesystem::path calibrationDirectory = outputDirectory / L"calibration";
+    if (options.calibration)
+    {
+        std::filesystem::create_directories(calibrationDirectory, filesystemError);
+        if (!std::filesystem::is_directory(calibrationDirectory))
+        {
+            std::fprintf(stderr, "calibration directory unavailable: %s\n",
+                calibrationDirectory.string().c_str());
             return 1;
         }
     }
@@ -580,6 +689,14 @@ int main(int argc, char** argv)
     const bool tagUi = sceneUi && uiMode != XEFG_SWAPCHAIN_UI_MODE_BACKBUFFER_HUDLESS;
     options.ui = sceneUi;
 
+    if (options.calibration && (options.width != 640 || options.height != 360
+        || uiMode != XEFG_SWAPCHAIN_UI_MODE_HUDLESS_UITEXTURE || !options.ui || !options.dumpInputs))
+    {
+        std::fprintf(stderr,
+            "--calibration requires 640x360, --ui-mode hudless-uitexture (mode 3), and --dump-inputs\n");
+        return 2;
+    }
+
     xefg_swapchain_d3d12_init_params_t initParameters{};
     initParameters.pApplicationSwapChain = nullptr;
     initParameters.initFlags = 0;
@@ -613,8 +730,15 @@ int main(int argc, char** argv)
     runtime.xefgSwapChainSetEnabled(fg, 1);
     if (uiMode != XEFG_SWAPCHAIN_UI_MODE_NONE)
         runtime.xefgSwapChainSetUiCompositionState(fg, XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED);
+    int interpolationOnlyResult = 0;
     if (options.showInterpolationOnly)
-        runtime.xefgSwapChainEnableDebugFeature(fg, XEFG_SWAPCHAIN_DEBUG_FEATURE_SHOW_ONLY_INTERPOLATION, 1, nullptr);
+        interpolationOnlyResult = int(runtime.xefgSwapChainEnableDebugFeature(
+            fg, XEFG_SWAPCHAIN_DEBUG_FEATURE_SHOW_ONLY_INTERPOLATION, 1, nullptr));
+    int tagInterpolatedResult = 0;
+    if (options.tagInterpolated)
+        tagInterpolatedResult = int(runtime.xefgSwapChainEnableDebugFeature(
+            fg, XEFG_SWAPCHAIN_DEBUG_FEATURE_TAG_INTERPOLATED_FRAMES, 1, nullptr));
+    std::vector<std::string> frameStatuses;
 
     xefg_swapchain_properties_t properties{};
     runtime.xefgSwapChainD3D12GetProperties(fg, &initParameters, 0, 0, DXGI_FORMAT_UNKNOWN, &properties);
@@ -641,6 +765,7 @@ int main(int argc, char** argv)
     }
 
     const uint32_t totalFrames = options.warmup + options.frames;
+    std::vector<CalibrationFrame> calibrationFrames;
     for (uint32_t frame = 0; frame < totalFrames; ++frame)
     {
         const bool recorded = frame >= options.warmup;
@@ -659,10 +784,24 @@ int main(int argc, char** argv)
         sceneOptions.ui = options.ui;
         sceneOptions.animateUi = options.animateUi;
         sceneOptions.flipMotionVectors = options.flipMotionVectors;
+        sceneOptions.calibration = options.calibration;
         sceneOptions.frameIndex = frame;
 
         oracle::SceneFrame scene;
         oracle::GenerateScene(sceneOptions, scene);
+
+        if (options.calibration)
+        {
+            wchar_t name[64]{};
+            swprintf_s(name, L"mid_%05u.bgra", frame);
+            const std::filesystem::path path = calibrationDirectory / name;
+            if (!oracle::WriteRawFile(path.wstring(), scene.expectedMid.data(), scene.expectedMid.size()))
+            {
+                std::fprintf(stderr, "calibration midpoint dump failed at frame %u\n", frame);
+                return 1;
+            }
+            calibrationFrames.push_back({frame, frame == 0 || frame == options.resetFrame});
+        }
 
         if (options.dumpInputs)
         {
@@ -766,17 +905,30 @@ int main(int argc, char** argv)
         constants.jitterOffsetY = 0.0f;
         constants.motionVectorScaleX = 1.0f;
         constants.motionVectorScaleY = 1.0f;
-        constants.resetHistory = frame == 0 ? 1u : 0u;
+        constants.resetHistory = (frame == 0 || frame == options.resetFrame) ? 1u : 0u;
         constants.frameRenderTime = static_cast<float>(options.pacingMilliseconds);
         runtime.xefgSwapChainTagFrameConstants(fg, frame, &constants);
         runtime.xefgSwapChainSetPresentId(fg, frame);
 
         capture->SetFrameIndex(frame);
         capture->SetEnabled(recorded);
+        LARGE_INTEGER presentStart{}, presentEnd{};
+        QueryPerformanceCounter(&presentStart);
         const HRESULT presented = proxy->Present(0, 0);
+        QueryPerformanceCounter(&presentEnd);
 
         xefg_swapchain_present_status_t status{};
-        runtime.xefgSwapChainGetLastPresentStatus(fg, &status);
+        const auto statusResult = runtime.xefgSwapChainGetLastPresentStatus(fg, &status);
+        std::ostringstream statusJson;
+        statusJson << "{\"application_frame\": " << frame
+                   << ", \"present_result\": " << static_cast<int32_t>(presented)
+                   << ", \"status_result\": " << int(statusResult)
+                   << ", \"frames_presented\": " << status.framesPresented
+                   << ", \"frame_generation_result\": " << int(status.frameGenResult)
+                   << ", \"is_frame_gen_enabled\": " << status.isFrameGenEnabled
+                   << ", \"present_start_qpc\": " << presentStart.QuadPart
+                   << ", \"present_end_qpc\": " << presentEnd.QuadPart << "}";
+        frameStatuses.push_back(statusJson.str());
         std::printf("frame %u: present=0x%08lx framesPresented=%u result=%d\n", frame,
             static_cast<unsigned long>(presented), status.framesPresented, int(status.frameGenResult));
         if (options.pacingMilliseconds) Sleep(options.pacingMilliseconds);
@@ -793,9 +945,19 @@ int main(int argc, char** argv)
         }
     }
 
-    capture->SetEnabled(false);
+    if (options.calibration)
+    {
+        std::string manifestError;
+        if (!WriteCalibrationManifest(calibrationDirectory, calibrationFrames, options.staticScene,
+            manifestError))
+        {
+            std::fprintf(stderr, "calibration manifest failed: %s\n", manifestError.c_str());
+            return 1;
+        }
+    }
+
     fixture.SignalAndWait();
-    proxy.Reset(); // destroys the provider context and joins its threads
+    proxy.Reset();
     std::string tensorError;
     const bool tensorOk = dispatcher.FinishTensors(tensorError);
     if (!tensorOk)
@@ -822,6 +984,9 @@ int main(int argc, char** argv)
          << ", \"initialization_fallback\": " << (initializationFallback ? "true" : "false")
          << ", \"animate_ui\": " << (options.animateUi ? "true" : "false")
          << ", \"dump_inputs\": " << (options.dumpInputs ? "true" : "false")
+         << ", \"calibration\": " << (options.calibration ? "true" : "false")
+         << ", \"tag_interpolated\": " << (options.tagInterpolated ? "true" : "false")
+         << ", \"reset_frame\": " << options.resetFrame
          << ", \"frames\": " << options.frames << ", \"warmup\": " << options.warmup
          << ", \"pacing_ms\": " << options.pacingMilliseconds
          << ", \"only_interpolation\": " << (options.showInterpolationOnly ? "true" : "false")
@@ -854,11 +1019,16 @@ int main(int argc, char** argv)
 
     dispatcher.Detach();
     if (fg) runtime.xefgSwapChainDestroy(fg);
+    capture->SetEnabled(false);
+    const bool presentsOk = WritePresentsManifest(outputDirectory, *capture,
+        options.showInterpolationOnly, interpolationOnlyResult, options.tagInterpolated,
+        tagInterpolatedResult, qpcFrequency.QuadPart, frameStatuses);
+    if (!presentsOk) std::fprintf(stderr, "could not write presents.json\n");
     if (xell) runtime.xellDestroyContext(xell);
     captureFactory.Reset();
     relay.Restore();
     trace.Close();
     runtime.Unload();
     std::printf("trace written to %s\n", (outputDirectory / L"trace").string().c_str());
-    return 0;
+    return presentsOk && capture->Error().empty() ? 0 : 1;
 }

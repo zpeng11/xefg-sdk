@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -42,7 +43,18 @@ struct CapturedPresent
     uint32_t height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     std::wstring file;
+    // Timestamps and the DXGI counter are taken around/after the native Present
+    // that produced this buffer. The application frame label above is set by
+    // the main thread and is diagnostic only: provider presents may run on
+    // another thread.
+    uint64_t presentStartQpc = 0;
+    uint64_t presentEndQpc = 0;
+    uint32_t dxgiPresentCount = 0;
+    int32_t dxgiPresentCountResult = 0;
+    int32_t nativePresentResult = 0;
 };
+
+inline constexpr uint64_t kInvalidCaptureToken = ~uint64_t{0};
 
 inline const wchar_t* FormatExtension(DXGI_FORMAT format)
 {
@@ -108,22 +120,33 @@ public:
         return error_;
     }
 
-    void Capture(IDXGISwapChain4* native, UINT index)
+    // Copies the buffer that is about to be presented. The copy runs on the
+    // queue DXGI handed to the factory for this chain (the provider's present
+    // queue), submitted before the native Present and waited on, so it sees the
+    // image being presented. The returned token identifies this record when the
+    // post-Present timing is attached; failures return kInvalidCaptureToken and
+    // never correlate with another thread's record.
+    uint64_t BeginCapture(IDXGISwapChain4* native, UINT index, ID3D12CommandQueue* queue)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!enabled_ || !native) return;
+        if (!enabled_ || !native) return kInvalidCaptureToken;
+        if (!queue)
+        {
+            Fail("present queue unavailable");
+            return kInvalidCaptureToken;
+        }
 
         ComPtr<ID3D12Resource> buffer;
         if (FAILED(native->GetBuffer(index, IID_PPV_ARGS(&buffer))) || !buffer)
         {
             Fail("GetBuffer failed");
-            return;
+            return kInvalidCaptureToken;
         }
         const D3D12_RESOURCE_DESC desc = buffer->GetDesc();
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1)
         {
             Fail("swap-chain buffer is not a 2D texture");
-            return;
+            return kInvalidCaptureToken;
         }
 
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
@@ -132,7 +155,7 @@ public:
         if (!total)
         {
             Fail("empty copyable footprint");
-            return;
+            return kInvalidCaptureToken;
         }
         if (!readback_ || readbackBytes_ < total)
         {
@@ -150,7 +173,7 @@ public:
                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback_))))
             {
                 Fail("readback buffer creation failed");
-                return;
+                return kInvalidCaptureToken;
             }
             readbackBytes_ = total;
         }
@@ -158,7 +181,7 @@ public:
         if (FAILED(allocator_->Reset()) || FAILED(list_->Reset(allocator_.Get(), nullptr)))
         {
             Fail("capture command list reset failed");
-            return;
+            return kInvalidCaptureToken;
         }
         D3D12_RESOURCE_BARRIER toCopy{};
         toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -179,15 +202,15 @@ public:
         if (FAILED(list_->Close()))
         {
             Fail("capture command list close failed");
-            return;
+            return kInvalidCaptureToken;
         }
         ID3D12CommandList* lists[]{list_.Get()};
-        queue_->ExecuteCommandLists(1, lists);
+        queue->ExecuteCommandLists(1, lists);
         const UINT64 value = ++fenceValue_;
-        if (FAILED(queue_->Signal(fence_.Get(), value)))
+        if (FAILED(queue->Signal(fence_.Get(), value)))
         {
             Fail("capture fence signal failed");
-            return;
+            return kInvalidCaptureToken;
         }
         if (fence_->GetCompletedValue() < value)
         {
@@ -195,7 +218,7 @@ public:
                 || WaitForSingleObject(fenceEvent_, 10000) != WAIT_OBJECT_0)
             {
                 Fail("capture fence wait timed out");
-                return;
+                return kInvalidCaptureToken;
             }
         }
 
@@ -203,7 +226,7 @@ public:
         if (FAILED(readback_->Map(0, nullptr, &mapped)))
         {
             Fail("readback map failed");
-            return;
+            return kInvalidCaptureToken;
         }
         const uint32_t width = static_cast<uint32_t>(desc.Width);
         const uint32_t height = desc.Height;
@@ -236,10 +259,35 @@ public:
         if (!file)
         {
             Fail("capture file could not be opened");
-            return;
+            return kInvalidCaptureToken;
         }
         file.write(reinterpret_cast<const char*>(tight.data()), static_cast<std::streamsize>(tight.size()));
+        file.close();
+        if (!file)
+        {
+            Fail("capture file write failed");
+            return kInvalidCaptureToken;
+        }
+        const uint64_t token = record.sequence;
         captures_.push_back(std::move(record));
+        return token;
+    }
+
+    void CompleteCapture(uint64_t token, uint64_t presentStartQpc, uint64_t presentEndQpc,
+        uint32_t dxgiPresentCount, int32_t dxgiPresentCountResult, int32_t nativePresentResult)
+    {
+        if (token == kInvalidCaptureToken) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& record : captures_)
+        {
+            if (static_cast<uint64_t>(record.sequence) != token) continue;
+            record.presentStartQpc = presentStartQpc;
+            record.presentEndQpc = presentEndQpc;
+            record.dxgiPresentCount = dxgiPresentCount;
+            record.dxgiPresentCountResult = dxgiPresentCountResult;
+            record.nativePresentResult = nativePresentResult;
+            return;
+        }
     }
 
 private:
@@ -270,8 +318,8 @@ private:
     ComPtr<ID3D12Resource> readback_;
     UINT64 readbackBytes_ = 0;
     std::wstring directory_;
-    bool enabled_ = true;
-    uint32_t frameIndex_ = 0;
+    std::atomic<bool> enabled_{true};
+    std::atomic<uint32_t> frameIndex_{0};
     uint32_t sequence_ = 0;
     std::mutex mutex_;
     std::vector<CapturedPresent> captures_;
@@ -281,8 +329,9 @@ private:
 class CaptureChain final : public IDXGISwapChain4
 {
 public:
-    CaptureChain(ComPtr<IDXGISwapChain4> native, std::shared_ptr<CaptureContext> context)
-        : native_(std::move(native)), context_(std::move(context))
+    CaptureChain(ComPtr<IDXGISwapChain4> native, ID3D12CommandQueue* presentQueue,
+        std::shared_ptr<CaptureContext> context)
+        : native_(std::move(native)), presentQueue_(presentQueue), context_(std::move(context))
     {
     }
 
@@ -323,17 +372,43 @@ public:
     HRESULT STDMETHODCALLTYPE Present(UINT interval, UINT flags) override
     {
         const UINT index = native_->GetCurrentBackBufferIndex();
-        if (!(flags & DXGI_PRESENT_TEST)) NativePresentOrdinal().fetch_add(1, std::memory_order_relaxed);
+        const bool captured = !(flags & DXGI_PRESENT_TEST);
+        if (captured) NativePresentOrdinal().fetch_add(1, std::memory_order_relaxed);
+        const uint64_t token = captured
+            ? context_->BeginCapture(native_.Get(), index, presentQueue_.Get()) : kInvalidCaptureToken;
+        LARGE_INTEGER start{}, end{};
+        QueryPerformanceCounter(&start);
         const HRESULT result = native_->Present(interval, flags);
-        if (!(flags & DXGI_PRESENT_TEST)) context_->Capture(native_.Get(), index);
+        QueryPerformanceCounter(&end);
+        if (captured)
+        {
+            UINT presentCount = 0;
+            const HRESULT presentCountResult = native_->GetLastPresentCount(&presentCount);
+            context_->CompleteCapture(token, static_cast<uint64_t>(start.QuadPart),
+                static_cast<uint64_t>(end.QuadPart), presentCount,
+                static_cast<int32_t>(presentCountResult), static_cast<int32_t>(result));
+        }
         return result;
     }
     HRESULT STDMETHODCALLTYPE Present1(UINT interval, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) override
     {
         const UINT index = native_->GetCurrentBackBufferIndex();
-        if (!(flags & DXGI_PRESENT_TEST)) NativePresentOrdinal().fetch_add(1, std::memory_order_relaxed);
+        const bool captured = !(flags & DXGI_PRESENT_TEST);
+        if (captured) NativePresentOrdinal().fetch_add(1, std::memory_order_relaxed);
+        const uint64_t token = captured
+            ? context_->BeginCapture(native_.Get(), index, presentQueue_.Get()) : kInvalidCaptureToken;
+        LARGE_INTEGER start{}, end{};
+        QueryPerformanceCounter(&start);
         const HRESULT result = native_->Present1(interval, flags, parameters);
-        if (!(flags & DXGI_PRESENT_TEST)) context_->Capture(native_.Get(), index);
+        QueryPerformanceCounter(&end);
+        if (captured)
+        {
+            UINT presentCount = 0;
+            const HRESULT presentCountResult = native_->GetLastPresentCount(&presentCount);
+            context_->CompleteCapture(token, static_cast<uint64_t>(start.QuadPart),
+                static_cast<uint64_t>(end.QuadPart), presentCount,
+                static_cast<int32_t>(presentCountResult), static_cast<int32_t>(result));
+        }
         return result;
     }
 
@@ -405,15 +480,17 @@ private:
     ~CaptureChain() = default;
     std::atomic<ULONG> references_{1};
     ComPtr<IDXGISwapChain4> native_;
+    ComPtr<ID3D12CommandQueue> presentQueue_;
     std::shared_ptr<CaptureContext> context_;
 };
 
 // Takes ownership of `native` (releases the caller's reference).
-inline ComPtr<IDXGISwapChain1> WrapForCapture(IDXGISwapChain1* native, std::shared_ptr<CaptureContext> context)
+inline ComPtr<IDXGISwapChain1> WrapForCapture(IDXGISwapChain1* native, std::shared_ptr<CaptureContext> context,
+    ID3D12CommandQueue* presentQueue = nullptr)
 {
     ComPtr<IDXGISwapChain4> chain4;
     if (!native || FAILED(native->QueryInterface(IID_PPV_ARGS(&chain4)))) return nullptr;
-    auto* wrapper = new CaptureChain(std::move(chain4), std::move(context));
+    auto* wrapper = new CaptureChain(std::move(chain4), presentQueue, std::move(context));
     ComPtr<IDXGISwapChain1> result;
     wrapper->QueryInterface(IID_PPV_ARGS(&result));
     wrapper->Release();
@@ -482,23 +559,31 @@ public:
         const DXGI_SWAP_CHAIN_DESC1* description, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen,
         IDXGIOutput* restrict, IDXGISwapChain1** chain) override
     {
+        // XeFG passes its present queue in the device slot. Captures must run on
+        // that queue, not the application queue used to initialize the probe.
+        ComPtr<ID3D12CommandQueue> presentQueue;
+        if (device) device->QueryInterface(IID_PPV_ARGS(&presentQueue));
         const HRESULT result = native_->CreateSwapChainForHwnd(device, window, description, fullscreen,
             restrict, chain);
-        if (SUCCEEDED(result)) Wrap(chain);
+        if (SUCCEEDED(result)) Wrap(chain, presentQueue.Get());
         return result;
     }
     HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(IUnknown* device, IUnknown* window,
         const DXGI_SWAP_CHAIN_DESC1* description, IDXGIOutput* restrict, IDXGISwapChain1** chain) override
     {
+        ComPtr<ID3D12CommandQueue> presentQueue;
+        if (device) device->QueryInterface(IID_PPV_ARGS(&presentQueue));
         const HRESULT result = native_->CreateSwapChainForCoreWindow(device, window, description, restrict, chain);
-        if (SUCCEEDED(result)) Wrap(chain);
+        if (SUCCEEDED(result)) Wrap(chain, presentQueue.Get());
         return result;
     }
     HRESULT STDMETHODCALLTYPE CreateSwapChainForComposition(IUnknown* device,
         const DXGI_SWAP_CHAIN_DESC1* description, IDXGIOutput* restrict, IDXGISwapChain1** chain) override
     {
+        ComPtr<ID3D12CommandQueue> presentQueue;
+        if (device) device->QueryInterface(IID_PPV_ARGS(&presentQueue));
         const HRESULT result = native_->CreateSwapChainForComposition(device, description, restrict, chain);
-        if (SUCCEEDED(result)) Wrap(chain);
+        if (SUCCEEDED(result)) Wrap(chain, presentQueue.Get());
         return result;
     }
     HRESULT STDMETHODCALLTYPE GetSharedResourceAdapterLuid(HANDLE resource, LUID* luid) override
@@ -522,12 +607,12 @@ public:
 private:
     ~CaptureFactory() = default;
 
-    void Wrap(IDXGISwapChain1** chain)
+    void Wrap(IDXGISwapChain1** chain, ID3D12CommandQueue* presentQueue)
     {
         if (!chain || !*chain) return;
         ComPtr<IDXGISwapChain4> chain4;
         if (FAILED((*chain)->QueryInterface(IID_PPV_ARGS(&chain4)))) return;
-        auto* wrapper = new CaptureChain(std::move(chain4), context_);
+        auto* wrapper = new CaptureChain(std::move(chain4), presentQueue, context_);
         ComPtr<IDXGISwapChain1> replacement;
         wrapper->QueryInterface(IID_PPV_ARGS(&replacement));
         wrapper->Release();

@@ -144,11 +144,16 @@ python -I -B -m unittest discover -s tests -v
 Synthetic unit tests and the small real-ORT smoke test need no captures.
 Capture integration tests are opt-in, with no machine-specific dataset defaults.
 See [development](docs/DEVELOPMENT.md) for fixture paths and native-tool tests.
+The independent [render-validation tool](tools/render-validation/README.md)
+captures official presents, verifies calibration frame pairing and compares
+same-input SDK replay against official output. Its independent DX12 renderer
+also covers indexed geometry, occlusion, camera motion and history resets.
 
 ```text
 src/xefg_sdk/          public runtime API, package loader, planner, executors
 src/xefg_sdk/export/   exporter and internal capture/graph reconstruction modules
 tools/capture/        optional native capture source, CMake, PowerShell scripts
+tools/render-validation/ official-present capture inventory and offline checks
 examples/             application input examples
 tests/                synthetic tests and opt-in capture integration
 docs/                 contracts, compatibility, capture interface, validation
