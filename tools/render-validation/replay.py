@@ -8,6 +8,8 @@ import sys
 import time
 
 import numpy as np
+import onnxruntime as ort
+from xefg_sdk.executors import OrtExecutor
 from PIL import Image
 from xefg_sdk import Config, FrameInputs, ImageView, UiMode, Xefg2xRuntime
 
@@ -61,7 +63,11 @@ def run_replay(args, tools):
     metrics = tools.load_tool("metrics")
     results = []
     package_files = []
-    with Xefg2xRuntime.load(args.package) as runtime:
+    session_options = ort.SessionOptions()
+    session_options.log_severity_level = 3
+    session_options.intra_op_num_threads = 1
+    session_options.inter_op_num_threads = 1
+    with Xefg2xRuntime.load(args.package, executor=OrtExecutor(session_options=session_options)) as runtime:
         package_files.append(tools.artifact(runtime.package.directory, "manifest.json"))
         for variant in runtime.package.variants.values():
             for name in [variant["model"], *variant["profiles"]]:
@@ -115,6 +121,7 @@ def run_replay(args, tools):
               "capture_directory": str(run), "package_directory": str(args.package.resolve()),
               "command": sys.argv, "git_commit": git("rev-parse", "HEAD"), "git_status": git("status", "--short"),
               "python": platform.python_version(),
+              "executor": {"provider": "CPUExecutionProvider", "intra_op_threads": 1, "inter_op_threads": 1},
               "versions": {name: importlib.metadata.version(name) for name in ("xefg-sdk", "numpy", "onnxruntime", "pillow")},
               "provider": {key: meta[key] for key in ("adapter", "xefg_family", "xefg_dll_sha256")},
               "pairing": tools.artifact(pairing_path.parent, pairing_path.name),

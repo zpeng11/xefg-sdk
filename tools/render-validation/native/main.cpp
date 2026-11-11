@@ -55,6 +55,7 @@ struct Options
     bool warp = false;
     bool debugLayer = false;
     bool tagInterpolated = true;
+    bool identityFgMatrices = false; // Diagnostic control; rendering/input textures stay unchanged.
 };
 
 std::wstring Widen(const std::string& text)
@@ -113,6 +114,7 @@ void Usage()
         "  --debug                 enable the D3D12 debug layer\n"
         "  --tag-interpolated      enable official generated-frame tagging (default)\n"
         "  --no-tag                disable official generated-frame tagging\n"
+        "  --identity-fg-matrices  diagnostic: submit identity matrices only to FG\n"
         "  --adapter <substring>   pick a DXGI adapter by name\n"
         "  --shader <file|dir>     override shaders/scene.hlsl next to the executable\n");
 }
@@ -144,6 +146,7 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error)
         else if (argument == "--debug") options.debugLayer = true;
         else if (argument == "--tag-interpolated") options.tagInterpolated = true;
         else if (argument == "--no-tag") options.tagInterpolated = false;
+        else if (argument == "--identity-fg-matrices") options.identityFgMatrices = true;
         else
         {
             error = "unknown argument: " + argument;
@@ -547,6 +550,7 @@ bool WriteMetaJson(const std::filesystem::path& path, const Options& options, Sc
          << ", \"tag_interpolated\": "
          << ((!options.renderOnly && options.tagInterpolated) ? "true" : "false")
          << ", \"render_only\": " << (options.renderOnly ? "true" : "false")
+         << ", \"fg_matrix_control\": \"" << (options.identityFgMatrices ? "identity" : "rendered") << "\""
          << ", \"reset_frames\": " << ResetFramesJson(scene, options.warmup, options.frames)
          << ", \"debug_layer\": " << (options.debugLayer ? "true" : "false") << "},\n";
     file << "  \"api_results\": {"
@@ -920,6 +924,12 @@ int main(int argc, char** argv)
         xefg_swapchain_frame_constant_data_t constants{};
         std::memcpy(constants.viewMatrix, state.view.m, sizeof(state.view.m));
         std::memcpy(constants.projectionMatrix, state.projection.m, sizeof(state.projection.m));
+        if (options.identityFgMatrices)
+        {
+            const Matrix4 identity = IdentityMatrix();
+            std::memcpy(constants.viewMatrix, identity.m, sizeof(identity.m));
+            std::memcpy(constants.projectionMatrix, identity.m, sizeof(identity.m));
+        }
         constants.jitterOffsetX = 0.0f;
         constants.jitterOffsetY = 0.0f;
         constants.motionVectorScaleX = 1.0f;

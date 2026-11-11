@@ -1,5 +1,13 @@
 # Render validation evidence — 2026-11-11
 
+## Latest numerical fix
+
+The original-model measurements below are retained as the baseline. The d24
+coordinate-rounding fix and regenerated mode1/3/4 package are recorded in
+[SPLAT_FIX.md](SPLAT_FIX.md): official same-grid tensors match in 20/20 probes,
+all 31 rendered mode3 frames meet the documented provisional numeric gate,
+and the full SDK suite passes 87/87 with no skips.
+
 ## Real DX12 raster scenes
 
 Final evidence: `D:/xefg-raster-matrix-20261111-final/`. The native renderer uses

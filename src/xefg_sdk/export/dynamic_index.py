@@ -164,35 +164,32 @@ def build_dynamic_splat(plan):
     b.add("Unsqueeze", ["sp_tid_x", "sp_ax0"], ["sp_tid_x2"])
     b.add("Unsqueeze", ["sp_tid_y", "sp_ax1"], ["sp_tid_y2"])
 
-    # Always the half-texel-centre form; at src == dst it reduces exactly to
-    # tid + ceil(disp).
+    # DXIL uses distinct same-size and rescaled coordinate rules.
     b.add("Cast", ["dst_w"], ["sp_dstw_f"], to=TensorProto.FLOAT)
     b.add("Cast", ["src_w"], ["sp_srcw_f"], to=TensorProto.FLOAT)
     b.add("Cast", ["dst_h"], ["sp_dsth_f"], to=TensorProto.FLOAT)
     b.add("Cast", ["src_h"], ["sp_srch_f"], to=TensorProto.FLOAT)
-    b.add("Div", ["sp_dstw_f", "sp_srcw_f"], ["sp_ratio_x"])
-    b.add("Div", ["sp_dsth_f", "sp_srch_f"], ["sp_ratio_y"])
     b.add("Add", ["sp_tid_x2", "sp_fhalf"], ["sp_tx0"])
     b.add("Add", ["sp_tx0", "sp_dx"], ["sp_tx1"])
-    b.add("Mul", ["sp_tx1", "sp_ratio_x"], ["sp_tx2"])
-    b.add("Sub", ["sp_tx2", "sp_fhalf"], ["sp_tx3"])
-    b.add("Ceil", ["sp_tx3"], ["sp_cx"])
+    b.add("Mul", ["sp_tx1", "sp_dstw_f"], ["sp_tx2"])
+    b.add("Div", ["sp_tx2", "sp_srcw_f"], ["sp_tx3"])
+    b.add("Round", ["sp_tx3"], ["sp_cx"])
     b.add("Add", ["sp_tid_y2", "sp_fhalf"], ["sp_ty0"])
     b.add("Add", ["sp_ty0", "sp_dy"], ["sp_ty1"])
-    b.add("Mul", ["sp_ty1", "sp_ratio_y"], ["sp_ty2"])
-    b.add("Sub", ["sp_ty2", "sp_fhalf"], ["sp_ty3"])
-    b.add("Ceil", ["sp_ty3"], ["sp_cy"])
-    # Two forms: the same-size shader uses tid + ceil(disp); the rescale form
-    # already yields the destination coordinate. They differ by one float32
-    # rounding at a tie (one byte at 1920x1080), so select at runtime rather
-    # than assuming the forms are bit-identical.
+    b.add("Mul", ["sp_ty1", "sp_dsth_f"], ["sp_ty2"])
+    b.add("Div", ["sp_ty2", "sp_srch_f"], ["sp_ty3"])
+    b.add("Round", ["sp_ty3"], ["sp_cy"])
+    # Same-size: tid + floor(disp + 0.5). Rescaled: Round_ne of the
+    # absolute destination coordinate, without subtracting a half texel.
     b.add("Equal", ["src_w", "dst_w"], ["sp_same_w"])
     b.add("Equal", ["src_h", "dst_h"], ["sp_same_h"])
     b.add("And", ["sp_same_w", "sp_same_h"], ["sp_same"])
-    b.add("Ceil", ["sp_dx"], ["sp_dx_ceil"])
-    b.add("Ceil", ["sp_dy"], ["sp_dy_ceil"])
-    b.add("Add", ["sp_tid_x2", "sp_dx_ceil"], ["sp_same_x"])
-    b.add("Add", ["sp_tid_y2", "sp_dy_ceil"], ["sp_same_y"])
+    b.add("Add", ["sp_dx", "sp_fhalf"], ["sp_dx_half"])
+    b.add("Add", ["sp_dy", "sp_fhalf"], ["sp_dy_half"])
+    b.add("Floor", ["sp_dx_half"], ["sp_dx_round"])
+    b.add("Floor", ["sp_dy_half"], ["sp_dy_round"])
+    b.add("Add", ["sp_tid_x2", "sp_dx_round"], ["sp_same_x"])
+    b.add("Add", ["sp_tid_y2", "sp_dy_round"], ["sp_same_y"])
     b.add("Where", ["sp_same", "sp_same_x", "sp_cx"], ["sp_dst_x_f"])
     b.add("Where", ["sp_same", "sp_same_y", "sp_cy"], ["sp_dst_y_f"])
     b.add("Cast", ["sp_dst_x_f"], ["sp_dst_x"], to=TensorProto.INT64)

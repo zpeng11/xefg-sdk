@@ -1501,25 +1501,19 @@ def splat_plan(run_dir, dispatch):
     tid_x = np.arange(src_w, dtype=np.float32)[None, :]
     tid_y = np.arange(src_h, dtype=np.float32)[:, None]
     if src_w == dst_w and src_h == dst_h:
-        # The shader does Round_ni(disp + 0.5). The hardware rounds halfway
-        # cases toward negative infinity (0.5 -> 0, -2.5 -> -3), which makes
-        # the whole expression exactly ceil(disp). The static scene cannot
-        # distinguish the tie rule because every displacement is -0.0; the
-        # velocity capture exposes it.
-        dst_x = np.arange(src_w, dtype=np.int64)[None, :] + np.ceil(
-            disp_x).astype(np.int64)
-        dst_y = np.arange(src_h, dtype=np.int64)[:, None] + np.ceil(
-            disp_y).astype(np.int64)
+        # DXIL Round_ni(disp + 0.5): floor after the float32 addition.
+        # Ties go toward +infinity, including negative half-integers.
+        dst_x = np.arange(src_w, dtype=np.int64)[None, :] + np.floor(
+            disp_x + np.float32(0.5)).astype(np.int64)
+        dst_y = np.arange(src_h, dtype=np.int64)[:, None] + np.floor(
+            disp_y + np.float32(0.5)).astype(np.int64)
     else:
-        # The half-texel-centre rescale, with the DXIL's own float32 operands.
-        # This path has no retained capture; it uses the same nearest-integer
-        # tie rule as the same-size path.
-        dst_x = np.ceil((tid_x + np.float32(0.5) + disp_x)
-                        * np.float32(dst_w) / np.float32(src_w)
-                        - np.float32(0.5)).astype(np.int64)
-        dst_y = np.ceil((tid_y + np.float32(0.5) + disp_y)
-                        * np.float32(dst_h) / np.float32(src_h)
-                        - np.float32(0.5)).astype(np.int64)
+        # The rescale branch uses Round_ne with no half-texel subtraction.
+        # Preserve the shader's multiply-then-divide float32 operation order.
+        dst_x = np.rint((tid_x + np.float32(0.5) + disp_x)
+                       * np.float32(dst_w) / np.float32(src_w)).astype(np.int64)
+        dst_y = np.rint((tid_y + np.float32(0.5) + disp_y)
+                       * np.float32(dst_h) / np.float32(src_h)).astype(np.int64)
 
     depth_key = _splat_depth_key(depth)
     key_x = np.uint32(0x80000000) | depth_key | _f32_to_half_bits(disp_x)

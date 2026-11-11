@@ -217,6 +217,20 @@ actual queue passed to the native swapchain factory. Using the application queue
 or copying after Present produced stale images in calibration; those failures
 and the corrected experiments are documented in [VALIDATION.md](VALIDATION.md).
 
+## d24 numerical fix and regression limits
+
+The fractional-motion splat-coordinate fix, official tensor experiments and new
+model package are documented in [SPLAT_FIX.md](SPLAT_FIX.md). Old model packages
+must be re-exported; updating Python source alone does not patch their ONNX graphs.
+Replay and diagnostic sampling tools pin ORT CPU threading to one thread for
+repeatable baselines; the SDK executor default is not changed.
+
+`check_quality.py --report <replay/report.json> --out <new-check.json>` applies
+explicit valid-region regression limits (MAE 0.01, maximum byte difference 8,
+over-two-byte pixel fraction 0.02%). The limits are CLI-configurable and scoped
+to the current four-scene 640x360 mode3 suite, not a universal quality claim.
+Multiple `--report` arguments check the full suite together.
+
 ## Four-scene matrix
 
 Once the native target passes its render-only tests, run the fixed short matrix:

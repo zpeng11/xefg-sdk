@@ -1906,29 +1906,33 @@ def build_splat(plan, prefix=""):
 
     b.const("sp_tid_x", "fp32", np.arange(p["src_w"], dtype=np.float32)[None, :])
     b.const("sp_tid_y", "fp32", np.arange(p["src_h"], dtype=np.float32)[:, None])
-    if p["src_w"] == p["dst_w"] and p["src_h"] == p["dst_h"]:
-        b.add("Ceil", ["sp_dx"], ["sp_cx"])
-        b.add("Ceil", ["sp_dy"], ["sp_cy"])
+    b.const("sp_fhalf", "fp32", 0.5)
+    same_size = p["src_w"] == p["dst_w"] and p["src_h"] == p["dst_h"]
+    if same_size:
+        b.add("Add", ["sp_dx", "sp_fhalf"], ["sp_dx_half"])
+        b.add("Add", ["sp_dy", "sp_fhalf"], ["sp_dy_half"])
+        b.add("Floor", ["sp_dx_half"], ["sp_cx"])
+        b.add("Floor", ["sp_dy_half"], ["sp_cy"])
     else:
-        b.const("sp_fhalf", "fp32", 0.5)
-        b.const("sp_ratio_x", "fp32", p["dst_w"] / p["src_w"])
-        b.const("sp_ratio_y", "fp32", p["dst_h"] / p["src_h"])
-        b.add("Add", ["sp_tid_x", "sp_fhalf"], ["sp_tx0"])
-        b.add("Add", ["sp_tx0", "sp_dx"], ["sp_tx1"])
-        b.add("Mul", ["sp_tx1", "sp_ratio_x"], ["sp_tx2"])
-        b.add("Sub", ["sp_tx2", "sp_fhalf"], ["sp_tx3"])
-        b.add("Ceil", ["sp_tx3"], ["sp_cx"])
-        b.add("Add", ["sp_tid_y", "sp_fhalf"], ["sp_ty0"])
-        b.add("Add", ["sp_ty0", "sp_dy"], ["sp_ty1"])
-        b.add("Mul", ["sp_ty1", "sp_ratio_y"], ["sp_ty2"])
-        b.add("Sub", ["sp_ty2", "sp_fhalf"], ["sp_ty3"])
-        b.add("Ceil", ["sp_ty3"], ["sp_cy"])
-    b.add("Cast", ["sp_tid_x"], ["sp_tidxi"], to=TensorProto.INT64)
-    b.add("Cast", ["sp_tid_y"], ["sp_tidyi"], to=TensorProto.INT64)
+        for axis, source, destination in (("x", p["src_w"], p["dst_w"]),
+                                          ("y", p["src_h"], p["dst_h"])):
+            b.const("sp_src_" + axis, "fp32", source)
+            b.const("sp_dst_size_" + axis, "fp32", destination)
+            b.add("Add", ["sp_tid_" + axis, "sp_fhalf"], ["sp_t" + axis + "0"])
+            b.add("Add", ["sp_t" + axis + "0", "sp_d" + axis], ["sp_t" + axis + "1"])
+            b.add("Mul", ["sp_t" + axis + "1", "sp_dst_size_" + axis], ["sp_t" + axis + "2"])
+            b.add("Div", ["sp_t" + axis + "2", "sp_src_" + axis], ["sp_t" + axis + "3"])
+            b.add("Round", ["sp_t" + axis + "3"], ["sp_c" + axis])
     b.add("Cast", ["sp_cx"], ["sp_cxi"], to=TensorProto.INT64)
     b.add("Cast", ["sp_cy"], ["sp_cyi"], to=TensorProto.INT64)
-    b.add("Add", ["sp_tidxi", "sp_cxi"], ["sp_dst_x"])
-    b.add("Add", ["sp_tidyi", "sp_cyi"], ["sp_dst_y"])
+    if same_size:
+        b.add("Cast", ["sp_tid_x"], ["sp_tidxi"], to=TensorProto.INT64)
+        b.add("Cast", ["sp_tid_y"], ["sp_tidyi"], to=TensorProto.INT64)
+        b.add("Add", ["sp_tidxi", "sp_cxi"], ["sp_dst_x"])
+        b.add("Add", ["sp_tidyi", "sp_cyi"], ["sp_dst_y"])
+    else:
+        b.add("Identity", ["sp_cxi"], ["sp_dst_x"])
+        b.add("Identity", ["sp_cyi"], ["sp_dst_y"])
 
     # Depth key: trunc((1 - depth) * 32767), clamped, shifted by 16.
     b.add("Sub", ["sp_f1", depth], ["sp_dk0"])
