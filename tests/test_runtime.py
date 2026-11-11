@@ -31,7 +31,7 @@ class CopyExecutor:
 
 def make_package(root):
     variants = {}
-    for mode in (1, 3):
+    for mode in (1, 3, 4):
         variant_id = "mode%d" % mode
         model = root / (variant_id + ".onnx")
         model.write_bytes(b"executor-owned opaque model " + bytes([mode]))
@@ -45,12 +45,16 @@ def make_package(root):
         }
         profile_name = variant_id + ".json"
         (root / profile_name).write_text(json.dumps(profile), encoding="utf-8")
+        inputs = ["previous_color", "current_color", "motion_vectors", "depth"]
+        if mode == 3:
+            inputs.append("ui")
+        elif mode == 4:
+            inputs.append("backbuffer")
         variants[variant_id] = {
             "mode": mode, "model": model.name,
             "model_sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
             "output": "generated_frame", "profiles": [profile_name],
-            "inputs": ["previous_color", "current_color", "motion_vectors", "depth"]
-                      + (["ui"] if mode == 3 else []),
+            "inputs": inputs,
         }
     (root / "manifest.json").write_text(json.dumps({
         "schema_version": 1, "name": "xefg2x", "variants": variants}), encoding="utf-8")
@@ -65,6 +69,21 @@ def frame(number, ui=False, reset=False):
         motion_vectors=ImageView(np.zeros((1, 2, 2), dtype=np.float16), "RG16_FLOAT"),
         ui=ImageView(np.zeros((2, 4, 4), dtype=np.uint8), "BGRA8_UNORM") if ui else None,
         reset_history=reset)
+
+
+def mode4_frame(number, hudless, backbuffer, ui=None, previous_backbuffer=True):
+    def image(value):
+        return ImageView(np.full((2, 4, 4), value, dtype=np.uint8),
+                         "BGRA8_UNORM")
+
+    return FrameInputs(
+        number,
+        backbuffer_color=image(backbuffer) if previous_backbuffer else None,
+        hudless_color=image(hudless),
+        depth=ImageView(np.ones((1, 2), dtype=np.float32), "R32_FLOAT"),
+        motion_vectors=ImageView(np.zeros((1, 2, 2), dtype=np.float16),
+                                 "RG16_FLOAT"),
+        ui=image(ui) if ui is not None else None)
 
 
 class RuntimeTests(unittest.TestCase):
@@ -93,6 +112,87 @@ class RuntimeTests(unittest.TestCase):
         result = self.runtime.interpolate_pair(frame(0, ui=True), frame(1, ui=True))
         self.assertEqual(result.ui_mode, UiMode.HUDLESS_UITEXTURE)
         self.assertIn("ui", self.executor.calls[0])
+
+    def test_explicit_mode4_uses_current_backbuffer(self):
+        previous = mode4_frame(0, hudless=10, backbuffer=101)
+        current = mode4_frame(1, hudless=11, backbuffer=202)
+        result = self.runtime.interpolate_pair(
+            previous, current, Config(ui_mode=UiMode.BACKBUFFER_HUDLESS))
+        self.assertEqual(result.ui_mode, UiMode.BACKBUFFER_HUDLESS)
+        self.assertEqual(result.profile_id, "mode4-4x2-mv2x1")
+        values = self.executor.calls[0]
+        np.testing.assert_array_equal(values["previous_color"],
+                                      np.full((2, 4, 4), 10, np.uint8))
+        np.testing.assert_array_equal(values["current_color"],
+                                      np.full((2, 4, 4), 11, np.uint8))
+        # The current backbuffer is used, never the previous one.
+        np.testing.assert_array_equal(values["backbuffer"],
+                                      np.full((2, 4, 4), 202, np.uint8))
+        self.assertNotIn("ui", values)
+
+    def test_mode4_needs_no_previous_backbuffer(self):
+        previous = mode4_frame(0, hudless=10, backbuffer=101,
+                               previous_backbuffer=False)
+        current = mode4_frame(1, hudless=11, backbuffer=202)
+        result = self.runtime.interpolate_pair(
+            previous, current, Config(ui_mode=UiMode.BACKBUFFER_HUDLESS))
+        self.assertEqual(result.ui_mode, UiMode.BACKBUFFER_HUDLESS)
+        np.testing.assert_array_equal(self.executor.calls[0]["backbuffer"],
+                                      np.full((2, 4, 4), 202, np.uint8))
+
+    def test_mode4_ignores_extra_ui(self):
+        previous = mode4_frame(0, hudless=10, backbuffer=101, ui=7)
+        current = mode4_frame(1, hudless=11, backbuffer=202, ui=8)
+        result = self.runtime.interpolate_pair(
+            previous, current, Config(ui_mode=UiMode.BACKBUFFER_HUDLESS))
+        self.assertEqual(result.ui_mode, UiMode.BACKBUFFER_HUDLESS)
+        self.assertNotIn("ui", self.executor.calls[0])
+
+    def test_mode4_requires_current_backbuffer(self):
+        current = mode4_frame(1, hudless=11, backbuffer=202,
+                              previous_backbuffer=False)
+        with self.assertRaisesRegex(ValueError, "required image"):
+            self.runtime.prepare(
+                mode4_frame(0, hudless=10, backbuffer=101),
+                current, Config(ui_mode=UiMode.BACKBUFFER_HUDLESS))
+
+    def test_mode4_rejects_mismatched_backbuffer_shape(self):
+        current = mode4_frame(1, hudless=11, backbuffer=202)
+        bad = FrameInputs(
+            current.frame_id,
+            backbuffer_color=ImageView(
+                np.zeros((2, 3, 4), np.uint8), "BGRA8_UNORM"),
+            hudless_color=current.hudless_color, depth=current.depth,
+            motion_vectors=current.motion_vectors)
+        with self.assertRaisesRegex(ValueError, "backbuffer"):
+            self.runtime.prepare(
+                mode4_frame(0, hudless=10, backbuffer=101), bad,
+                Config(ui_mode=UiMode.BACKBUFFER_HUDLESS))
+
+    def test_auto_never_selects_mode4(self):
+        # AUTO keeps its old behavior: a hudless pair plus a backbuffer pair
+        # without UI resolves to mode 1, not mode 4.
+        previous = mode4_frame(0, hudless=10, backbuffer=101)
+        current = mode4_frame(1, hudless=11, backbuffer=202)
+        result = self.runtime.interpolate_pair(previous, current)
+        self.assertEqual(result.ui_mode, UiMode.NONE)
+        self.assertEqual(result.profile_id, "mode1-4x2-mv2x1")
+        values = self.executor.calls[0]
+        self.assertNotIn("backbuffer", values)
+        # Mode 1 ignores the hudless pair and submits the backbuffer pair.
+        np.testing.assert_array_equal(values["previous_color"],
+                                      np.full((2, 4, 4), 101, np.uint8))
+        np.testing.assert_array_equal(values["current_color"],
+                                      np.full((2, 4, 4), 202, np.uint8))
+
+    def test_explicit_obsolete_ui_modes_are_rejected(self):
+        for mode in (UiMode.BACKBUFFER_UITEXTURE,
+                     UiMode.BACKBUFFER_HUDLESS_UITEXTURE):
+            with self.assertRaisesRegex(ValueError, "only NONE"):
+                self.runtime.prepare(
+                    mode4_frame(0, hudless=10, backbuffer=101),
+                    mode4_frame(1, hudless=11, backbuffer=202),
+                    Config(ui_mode=mode))
 
     def test_session_owns_history_and_resets(self):
         session = Xefg2xSession(self.runtime)

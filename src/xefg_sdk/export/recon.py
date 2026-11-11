@@ -2130,7 +2130,9 @@ def reconstruct_final_composite(run_dir, dispatch, capture=None):
         w = g * g * (np.float32(3.0) - np.float32(2.0) * g)
         keep = np.float32(1.0) - w
         if mode == 4:
-            out = [t10[i] + (m2[i] - t8[i]) * keep for i in range(3)]
+            # The d38 mode-4 branch uses the final full m (%223), not the
+            # intermediate m2 (%205): t10 + keep * (m - t8).
+            out = [t10[i] + (m[i] - t8[i]) * keep for i in range(3)]
         else:
             q2 = [q[i] + m2[i] * (np.float32(1.0) - q[3]) for i in range(3)]
             out = [t10[i] - keep * p[i] + keep * q2[i] for i in range(3)]

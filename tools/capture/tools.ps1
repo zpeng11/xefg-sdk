@@ -201,7 +201,8 @@ function Assert-XefgCapture {
         [Parameter(Mandatory = $true)][string]$RunDir,
         [Parameter(Mandatory = $true)][int]$TensorDispatches,
         [int]$Width = 0,
-        [int]$Height = 0
+        [int]$Height = 0,
+        [ValidateRange(0, 2147483647)][int]$Mode = 0
     )
 
     $traceDir = Join-Path $RunDir "trace"
@@ -286,6 +287,42 @@ function Assert-XefgCapture {
             throw "trace/trace.jsonl contains duplicate dispatch row $dispatch."
         }
         $rows[$dispatch] = $event
+    }
+
+    # The final composite's c[14] records the variant actually used. Read it
+    # from the captured trace, never from meta.json, so an explicit mode cannot
+    # be relabelled by the producer's metadata.
+    if ($Mode -gt 0) {
+        $verifiedFrames = 0
+        foreach ($group in @($rows.Values | Group-Object { [int]$_.frame })) {
+            $ordered = @($group.Group | Sort-Object { [int]$_.dispatch })
+            if ($ordered.Count -lt 38) {
+                continue
+            }
+            $d38 = $ordered[37]
+            $values = $null
+            foreach ($constant in @($d38.constants)) {
+                if ($null -eq $constant -or -not $constant.PSObject.Properties["values"]) {
+                    continue
+                }
+                $candidate = @($constant.values)
+                if ($candidate.Count -ge 15) {
+                    $values = $candidate
+                    break
+                }
+            }
+            if ($null -eq $values) {
+                throw "trace d38 in frame $($group.Name) has no constant values for c[14]; cannot verify mode $Mode."
+            }
+            $actual = [int]$values[14]
+            if ($actual -ne $Mode) {
+                throw "trace d38 c[14]=$actual in frame $($group.Name) does not match requested mode $Mode."
+            }
+            $verifiedFrames++
+        }
+        if ($verifiedFrames -eq 0) {
+            throw "trace has no complete 38-dispatch frame; cannot verify mode $Mode."
+        }
     }
 
     $missingRows = New-Object System.Collections.Generic.List[string]

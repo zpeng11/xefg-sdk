@@ -39,21 +39,32 @@ class Fixture:
 
     def __init__(self, root, frames=(1, 2, 3), colors=None, motion=None,
                  depth=None, ui=b"ui-static", lut=b"lut-constant", mode=3,
-                 ui_off=False, trace_config=None):
+                 ui_off=False, trace_config=None, backbuffers=None,
+                 trace_backbuffers=None):
         self.root = root
         self.trace_dir = os.path.join(root, "trace")
         self.tensors = os.path.join(self.trace_dir, "tensors")
         os.makedirs(self.tensors)
         self.frames = list(frames)
+        first_frame, last_frame = min(self.frames) - 1, max(self.frames) + 1
         self.colors = colors or {
             frame: ("color-%d" % frame).encode()
-            for frame in range(min(self.frames) - 1, max(self.frames) + 2)}
+            for frame in range(first_frame, last_frame + 1)}
         self.motion = motion or {
             frame: ("mv-%d" % frame).encode()
-            for frame in range(min(self.frames) - 1, max(self.frames) + 2)}
+            for frame in range(first_frame, last_frame + 1)}
         self.depth = depth or {
             frame: ("depth-%d" % frame).encode()
-            for frame in range(min(self.frames) - 1, max(self.frames) + 2)}
+            for frame in range(first_frame, last_frame + 1)}
+        self.backbuffers = backbuffers or {
+            frame: ("backbuffer-%d" % frame).encode()
+            for frame in range(first_frame, last_frame + 1)}
+        # The trace may deliberately bind a different backbuffer than the
+        # application input for a frame, which lets a test prove that a
+        # previous-frame binding is reported as a mismatch.
+        self.trace_backbuffers = dict(self.backbuffers)
+        if trace_backbuffers:
+            self.trace_backbuffers.update(trace_backbuffers)
         self.ui = ui
         self.lut = lut
         self.mode = mode
@@ -77,6 +88,13 @@ class Fixture:
         with open(os.path.join(self.tensors, name), "wb") as handle:
             handle.write(data)
         return name
+
+    def rewrite_tensor(self, frame, node, slot, data):
+        """Replace one captured tensor without changing the trace payload."""
+        dispatch = (frame - 1) * 38 + node
+        name = "d%04d_%s_in.bin" % (dispatch, slot)
+        with open(os.path.join(self.tensors, name), "wb") as handle:
+            handle.write(data)
 
     def _srv(self, slot, resource, data, dispatch, fmt=87, width=64,
              height=36):
@@ -125,6 +143,15 @@ class Fixture:
                           fmt=61, width=32, height=32),
             ]
         if node == 38:
+            if self.mode == 4:
+                backbuffer = self.trace_backbuffers[frame]
+                return [
+                    self._srv("t8", pointer(current), current, dispatch),
+                    self._srv("t9", pointer(backbuffer), backbuffer, dispatch),
+                    self._srv("t10", pointer(backbuffer), backbuffer, dispatch),
+                    self._srv("t11", pointer(previous), previous, dispatch),
+                    self._srv("t12", pointer(current), current, dispatch),
+                ]
             bound_ui = current if self.ui_off else self.ui
             resources = [
                 self._srv("t9", pointer(bound_ui), bound_ui, dispatch),
@@ -172,12 +199,25 @@ class Fixture:
             }, handle)
 
     def write_application_inputs(self, app_frames, directory="app",
-                                 ui_off=None):
-        """Write a manifest and input files; returns the application root."""
+                                 ui_off=None, native=False):
+        """Write a manifest and input files; returns the application root.
+
+        ``native=True`` mirrors the capture tool's layout:
+        ``<root>/application_inputs/manifest.json`` with file names relative to
+        that directory.  The default layout keeps the older oracle fixture
+        shape (``<root>/manifest.json`` plus ``inputs/``).
+        """
         if ui_off is None:
             ui_off = self.ui_off
         root = os.path.join(self.root, directory)
-        inputs = os.path.join(root, "inputs")
+        if native:
+            inputs = os.path.join(root, "application_inputs")
+            manifest_dir = inputs
+            prefix = ""
+        else:
+            inputs = os.path.join(root, "inputs")
+            manifest_dir = root
+            prefix = "inputs/"
         os.makedirs(inputs)
         records = []
         for frame in app_frames:
@@ -191,7 +231,8 @@ class Fixture:
             payloads = {
                 "color": self.colors[frame],
                 "ui": b"ui-off-zero" if ui_off else self.ui,
-                "backbuffer": b"backbuffer-%d" % frame,
+                "backbuffer": self.backbuffers.get(
+                    frame, b"backbuffer-%d" % frame),
                 "depth": self.depth[frame],
                 "motion": self.motion[frame],
             }
@@ -200,14 +241,29 @@ class Fixture:
                     handle.write(payloads[key])
             records.append({
                 "index": frame,
-                "inputs": {key: "inputs/" + name
+                "inputs": {key: prefix + name
                            for key, name in names.items()},
             })
-        with open(os.path.join(root, "manifest.json"), "w",
+        manifest = {
+            "schema": "xefg.application_inputs/1",
+            "configuration": self.configuration,
+            "frames": records,
+        }
+        if native:
+            ordered = sorted(app_frames)
+            manifest.update({
+                "frame_count": len(ordered),
+                "first_frame": ordered[0] if ordered else None,
+                "last_frame": ordered[-1] if ordered else None,
+                "traced_frames": len(self.frames),
+                "frame_semantics": (
+                    "index is the application frame including warmup; color "
+                    "is the hudless color, backbuffer is the premultiplied UI "
+                    "over it"),
+            })
+        with open(os.path.join(manifest_dir, "manifest.json"), "w",
                   encoding="utf-8") as handle:
-            json.dump({"schema": "xefg.application_inputs/1",
-                       "configuration": self.configuration,
-                       "frames": records}, handle)
+            json.dump(manifest, handle)
         return root
 
 
@@ -385,6 +441,223 @@ class ProvenanceTests(unittest.TestCase):
         lut = report["boundary"]["inputs"]["lut"]
         self.assertEqual(lut["status"], "mismatch")
         self.assertFalse(lut["matches_expected_sha256"])
+
+
+class Mode4ProvenanceTests(unittest.TestCase):
+    """Mode 4: t8/current colour plus t10/current backbuffer, never a UI input."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = self.temporary.name
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _report(self, fixture, **kwargs):
+        return input_provenance.build_report(
+            fixture.trace_path, expected_lut_sha256=sha(fixture.lut),
+            **kwargs)
+
+    def test_mode4_uses_t8_and_current_backbuffer_without_ui(self):
+        fixture = Fixture(self.root, mode=4)
+        app = fixture.write_application_inputs((0, 1, 2, 3))
+        report = self._report(fixture, application_inputs=app)
+
+        self.assertEqual(report["status"], "confirmed")
+        self.assertEqual(report["d38_mode"]["distinct"], [4])
+        self.assertEqual(report["d38_mode"]["spec_mode"], 4)
+        self.assertEqual(report["d38_mode"]["boundary_spec"], "mode4")
+
+        inputs = report["boundary"]["inputs"]
+        self.assertNotIn("ui", inputs)
+        self.assertEqual(set(inputs),
+                         {"prev_color", "current_color", "motion", "depth",
+                          "backbuffer", "lut"})
+
+        current = inputs["current_color"]
+        self.assertEqual(current["status"], "confirmed")
+        self.assertEqual(current["frame_shift"], 0)
+        self.assertEqual(current["alias_status"], "confirmed")
+        self.assertIn({"dispatch": 38, "slot": "t8"}, current["slots"])
+
+        backbuffer = inputs["backbuffer"]
+        self.assertEqual(backbuffer["kind"], "backbuffer")
+        self.assertEqual(backbuffer["status"], "confirmed")
+        self.assertEqual(backbuffer["frame_shift"], 0)
+        self.assertEqual(backbuffer["slots"],
+                         [{"dispatch": 38, "slot": "t10"}])
+        for item in backbuffer["per_frame"]:
+            self.assertEqual(item["application_frames"], [item["frame"]])
+            self.assertEqual(item["observed_shifts"], [0])
+
+        self.assertEqual(inputs["prev_color"]["frame_shift"], -1)
+        self.assertEqual(inputs["motion"]["frame_shift"], 0)
+        self.assertEqual(inputs["depth"]["frame_shift"], 0)
+
+        unused = report["boundary"]["unused_slots"]
+        self.assertEqual([entry["slot"] for entry in unused], ["d38.t9"])
+        self.assertEqual(unused[0]["alias_status"], "confirmed")
+        for item in unused[0]["per_frame"]:
+            self.assertEqual(item["application_frames"], [item["frame"]])
+
+    def test_mode4_changing_ui_backbuffer_matches_current_not_previous(self):
+        # The default fixture gives every frame a different backbuffer, which
+        # is the changing-UI case: current and previous backbuffer content
+        # differ, so a wrong temporal binding cannot match by accident.
+        fixture = Fixture(self.root, mode=4)
+        for frame in (1, 2, 3):
+            self.assertNotEqual(fixture.backbuffers[frame],
+                                fixture.backbuffers[frame - 1])
+        app = fixture.write_application_inputs((0, 1, 2, 3))
+        report = self._report(fixture, application_inputs=app)
+
+        self.assertEqual(report["status"], "confirmed")
+        for item in report["boundary"]["inputs"]["backbuffer"]["per_frame"]:
+            self.assertEqual(item["application_frames"], [item["frame"]])
+            self.assertEqual(item["observed_shifts"], [0])
+
+    def test_mode4_previous_frame_backbuffer_binding_is_a_mismatch(self):
+        # The trace binds frame 2's t9/t10 to frame 1's backbuffer, while the
+        # application inputs still describe frame 2.  The current-backbuffer
+        # expectation must fail rather than silently accepting the alias.
+        fixture = Fixture(
+            self.root, mode=4,
+            trace_backbuffers={2: b"backbuffer-1"})
+        app = fixture.write_application_inputs((0, 1, 2, 3))
+        report = self._report(fixture, application_inputs=app)
+
+        self.assertEqual(report["status"], "mismatch")
+        backbuffer = report["boundary"]["inputs"]["backbuffer"]
+        self.assertEqual(backbuffer["status"], "mismatch")
+        frame_two = next(item for item in backbuffer["per_frame"]
+                         if item["frame"] == 2)
+        self.assertEqual(frame_two["application_frames"], [1])
+        self.assertEqual(frame_two["observed_shifts"], [-1])
+
+    def test_mode4_previous_colour_at_t8_breaks_the_alias(self):
+        fixture = Fixture(self.root, mode=4)
+        fixture.rewrite_tensor(2, 38, "t8", fixture.colors[1])
+        report = self._report(fixture)
+
+        current = report["boundary"]["inputs"]["current_color"]
+        self.assertEqual(current["alias_status"], "mismatch")
+        self.assertEqual(report["status"], "mismatch")
+
+    def test_mode4_frames_without_tensor_snapshots_stay_partial(self):
+        # The trace may contain more frames than the retained tensor snapshots
+        # (for example traced frames 3..5 after tensors for 1..2).  Those later
+        # frames must remain unavailable evidence, not be dropped to force a
+        # confirmed top-level status.
+        fixture = Fixture(self.root, mode=4, frames=(1, 2, 3, 4, 5))
+        for frame in (3, 4, 5):
+            for node in range(1, 39):
+                dispatch = (frame - 1) * 38 + node
+                prefix = "d%04d_" % dispatch
+                for name in os.listdir(fixture.tensors):
+                    if name.startswith(prefix):
+                        os.remove(os.path.join(fixture.tensors, name))
+        app = fixture.write_application_inputs((0, 1, 2, 3, 4, 5))
+        report = self._report(fixture, application_inputs=app)
+
+        self.assertEqual(report["status"], "partial")
+        current = report["boundary"]["inputs"]["current_color"]
+        self.assertEqual(current["alias_status"], "partial")
+        per_frame = {item["frame"]: item for item in current["per_frame"]}
+        for frame in (1, 2):
+            self.assertEqual(per_frame[frame]["status"], "unique")
+            self.assertEqual(per_frame[frame]["observed_shifts"], [0])
+        for frame in (3, 4, 5):
+            self.assertEqual(per_frame[frame]["status"], "unavailable")
+            self.assertIsNone(per_frame[frame]["content_sha256"])
+
+    def test_native_application_inputs_manifest_is_discovered(self):
+        fixture = Fixture(self.root, mode=4)
+        root = fixture.write_application_inputs(
+            (0, 1, 2, 3), native=True)
+        report = self._report(fixture, application_inputs=root)
+
+        self.assertEqual(report["status"], "confirmed")
+        self.assertEqual(
+            report["application_inputs"]["manifest"],
+            os.path.join(root, "application_inputs", "manifest.json"))
+        self.assertEqual(report["application_inputs"]["errors"], [])
+        self.assertEqual(report["application_inputs"]["kinds"]["backbuffer"],
+                         4)
+
+    def test_manifest_with_unusable_paths_falls_back_to_raw_files(self):
+        fixture = Fixture(self.root, mode=4)
+        root = fixture.write_application_inputs(
+            (0, 1, 2, 3), native=True)
+        manifest_path = os.path.join(
+            root, "application_inputs", "manifest.json")
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        for record in manifest["frames"]:
+            for key in record["inputs"]:
+                record["inputs"][key] = "missing_" + record["inputs"][key]
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+
+        report = self._report(fixture, application_inputs=root)
+        self.assertEqual(report["status"], "confirmed")
+        self.assertTrue(any("falling back to raw filename discovery" in error
+                            for error in report["application_inputs"]["errors"]))
+        self.assertEqual(report["application_inputs"]["kinds"]["backbuffer"],
+                         4)
+
+    def test_mode1_still_uses_the_ui_boundary(self):
+        fixture = Fixture(self.root, mode=1)
+        app = fixture.write_application_inputs((0, 1, 2, 3))
+        report = self._report(fixture, application_inputs=app)
+
+        self.assertEqual(report["d38_mode"]["spec_mode"], 1)
+        self.assertEqual(report["d38_mode"]["boundary_spec"], "mode1_3")
+        self.assertIn("ui", report["boundary"]["inputs"])
+        self.assertNotIn("backbuffer", report["boundary"]["inputs"])
+        self.assertEqual(report["boundary"]["unused_slots"], [])
+
+
+CAPTURE_ENV = "XEFG_MODE4_CAPTURE"
+
+
+@unittest.skipUnless(
+    os.environ.get(CAPTURE_ENV),
+    "set %s to a mode 4 capture root to run the capture-backed report"
+    % CAPTURE_ENV)
+class Mode4CaptureProvenanceTests(unittest.TestCase):
+    """Opt-in check against a real capture; no source-tree paths are assumed."""
+
+    def test_real_mode4_capture_report(self):
+        root = os.environ[CAPTURE_ENV]
+        trace = os.path.join(root, "trace", "trace.jsonl")
+        self.assertTrue(os.path.isfile(trace), trace)
+        report = input_provenance.build_report(
+            trace, application_inputs=root)
+
+        self.assertEqual(report["d38_mode"]["distinct"], [4])
+        self.assertEqual(report["d38_mode"]["spec_mode"], 4)
+        inputs = report["boundary"]["inputs"]
+        self.assertNotIn("ui", inputs)
+        self.assertIn({"dispatch": 38, "slot": "t8"},
+                      inputs["current_color"]["slots"])
+        # The trace extends past the retained tensor snapshots, so the
+        # aggregate status is partial; the traced frames carry the actual
+        # shift evidence checked below.
+        self.assertEqual(inputs["backbuffer"]["hypothesis_frame_shift"], 0)
+
+        # The capture retains tensors for its traced frames (1 and 2); later
+        # trace frames are reported as unavailable rather than guessed.
+        for name in ("current_color", "backbuffer", "motion", "depth"):
+            traced = [item for item in inputs[name]["per_frame"]
+                      if item["frame"] in (1, 2)]
+            self.assertEqual(len(traced), 2)
+            for item in traced:
+                self.assertEqual(item["application_frames"], [item["frame"]])
+                self.assertEqual(item["observed_shifts"], [0])
+
+        unused = report["boundary"]["unused_slots"]
+        self.assertEqual([entry["slot"] for entry in unused], ["d38.t9"])
+        self.assertNotIn("ui", inputs)
 
 
 if __name__ == "__main__":

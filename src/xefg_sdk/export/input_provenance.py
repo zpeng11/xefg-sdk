@@ -16,22 +16,26 @@ questions without inferring any transformation that was not observed:
 Frame identity is only *proved* when the trace content can be matched against
 application inputs saved by ``XefgOracle`` (``manifest.json`` plus ``inputs/``)
 or by a scene-only exporter that links the repository's exact ``scene.cpp``.
-Without that comparison, previous/current colour can still be related to one
-another inside the trace (``prev(f) == current(f-1)``), but motion vectors and
-depth at frame ``f`` cannot be distinguished from those at ``f-1``; the report
-records ``unresolved`` rather than guessing.  The UI is genuinely static in
-the scene, so its content is frame-invariant and its current/previous identity
-is not observable from content alone.
+Native capture output uses ``application_inputs/manifest.json`` with file
+names relative to that directory; both layouts are accepted.  Without a
+comparison, previous/current colour can still be related to one another inside
+the trace (``prev(f) == current(f-1)``), but motion vectors and depth at frame
+``f`` cannot be distinguished from those at ``f-1``; the report records
+``unresolved`` rather than guessing.  The UI is genuinely static in the legacy
+scene, so its content is frame-invariant and its current/previous identity is
+not observable from content alone.
 
-The profiled slot map is the one used by the fg78 build and the d38 modes 1/3
-boundary:
+The observed d38 mode selects the boundary map.  All supported modes share:
 
     prev_color     d1.t0   d25.t2   d38.t11
     current_color  d1.t1   d25.t3   d38.t12
     motion         d24.t0  d25.t4
     depth          d24.t1  d25.t5
-    ui             d38.t9
     lut            d25.t6
+
+The mode 1/3 report also inspects d38.t9 (UI in mode 3, a placeholder in mode 1).
+Mode 4 adds d38.t8 to current_color and d38.t10 as the current backbuffer; its
+unused t9 binding is reported separately.
 """
 # Internal provenance helper retained for synthetic tests; not a supported CLI
 # entry point.
@@ -46,12 +50,19 @@ SCHEMA = "xefg.input_provenance/1"
 KNOWN_LUT_SHA256 = (
     "49e55b012bc0575066e0342bf533f142d5895348152a2c9fe31d00406ded1e5d"
 )
-BOUNDARY_D38_MODES = (1, 3)
+LEGACY_D38_MODES = (1, 3)
+SUPPORTED_D38_MODES = (1, 3, 4)
+# Compatibility alias; supported modes are listed separately.
+BOUNDARY_D38_MODES = LEGACY_D38_MODES
 
 __all__ = [
     "SCHEMA",
     "KNOWN_LUT_SHA256",
+    "LEGACY_D38_MODES",
+    "SUPPORTED_D38_MODES",
+    "BOUNDARY_D38_MODES",
     "BOUNDARY_INPUTS",
+    "MODE_BOUNDARY_INPUTS",
     "load_trace",
     "load_application_inputs",
     "build_report",
@@ -92,7 +103,26 @@ BOUNDARY_INPUTS = (
               application=False),
 )
 
-_INPUT_SPECS = {spec.name: spec for spec in BOUNDARY_INPUTS}
+MODE4_BOUNDARY_INPUTS = (
+    InputSpec("prev_color", "color", ((1, "t0"), (25, "t2"), (38, "t11")),
+              expected_shift=-1),
+    InputSpec("current_color", "color",
+              ((1, "t1"), (25, "t3"), (38, "t12"), (38, "t8")),
+              expected_shift=0),
+    InputSpec("motion", "motion", ((24, "t0"), (25, "t4")),
+              expected_shift=0),
+    InputSpec("depth", "depth", ((24, "t1"), (25, "t5")),
+              expected_shift=0),
+    InputSpec("backbuffer", "backbuffer", ((38, "t10"),), expected_shift=0),
+    InputSpec("lut", "lut", ((25, "t6"),), expected_shift=None,
+              application=False),
+)
+
+MODE_BOUNDARY_INPUTS = {
+    1: BOUNDARY_INPUTS,
+    3: BOUNDARY_INPUTS,
+    4: MODE4_BOUNDARY_INPUTS,
+}
 
 _APP_PATTERNS = (
     ("color", re.compile(r"^color_(\d+)\.bgra$", re.IGNORECASE)),
@@ -104,11 +134,11 @@ _APP_PATTERNS = (
 )
 
 _MANIFEST_FIELDS = (
-    ("color", "color"),
-    ("ui", "ui"),
-    ("backbuffer", "backbuffer"),
-    ("depth", "depth"),
-    ("motion", "motion"),
+    ("color", ("color",)),
+    ("ui", ("ui",)),
+    ("backbuffer", ("backbuffer",)),
+    ("depth", ("depth",)),
+    ("motion", ("motion", "mv", "motion_vectors")),
 )
 
 
@@ -250,25 +280,134 @@ def _trace_meta(trace_path):
     return {}, None
 
 
-def load_application_inputs(path):
-    """Load application inputs from an oracle output/manifest or raw frame dir.
+def _manifest_candidates(root):
+    """Return manifest paths to try, most specific layout first."""
+    if os.path.isfile(root):
+        return [root]
+    return [
+        os.path.join(root, "manifest.json"),
+        # Native oracle/capture layout: <root>/application_inputs/manifest.json
+        os.path.join(root, "application_inputs", "manifest.json"),
+        os.path.join(root, "inputs", "manifest.json"),
+    ]
 
-    Accepts either ``manifest.json`` itself, an oracle output root containing
-    ``manifest.json`` and ``inputs/``, or a directory of raw
-    ``color_*.bgra`` / ``ui_*.bgra`` / ``depth_*.r32f`` / ``mv_*.rg16f``
-    files.  Every file that exists is hashed; missing files are recorded but
-    do not abort the inventory.
+
+def _find_manifest(root):
+    for candidate in _manifest_candidates(root):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _manifest_records(manifest, base, errors):
+    """Convert a manifest's declared frame inputs into file records.
+
+    The native ``xefg.application_inputs/1`` format stores relative names
+    directly in each frame's ``inputs`` object (for example ``color_00000.bgra``
+    next to the manifest).  The older oracle fixture layout prefixes them with
+    ``inputs/``.  Both are resolved against the manifest's own directory.
+    """
+    records = []
+    frames = manifest.get("frames")
+    if isinstance(frames, dict):
+        frames = [dict(value, index=key) if isinstance(value, dict) else value
+                  for key, value in frames.items()]
+    if not isinstance(frames, (list, tuple)):
+        errors.append("manifest has no frames list")
+        return records
+    for item in frames:
+        if not isinstance(item, dict):
+            errors.append("manifest frame is not an object")
+            continue
+        frame = _as_int(item.get("index"))
+        if frame is None:
+            frame = _as_int(item.get("frame"))
+        if frame is None:
+            errors.append("manifest frame without an index")
+            continue
+        inputs = item.get("inputs")
+        if not isinstance(inputs, dict):
+            # Some manifests declare the keys directly on the frame object.
+            inputs = {key: value for key, value in item.items()
+                      if key not in ("index", "frame")}
+        for kind, aliases in _MANIFEST_FIELDS:
+            field = None
+            relative = None
+            for alias in aliases:
+                if inputs.get(alias):
+                    field = alias
+                    relative = inputs[alias]
+                    break
+            if not relative:
+                continue
+            file_path = os.path.join(
+                base, str(relative).replace("/", os.sep))
+            records.append({"frame": frame, "kind": kind,
+                            "path": file_path,
+                            "source": "manifest.inputs.%s" % field})
+    return records
+
+
+def _raw_records(directories, errors, seen=None):
+    """Auto-discover raw application input files by filename."""
+    records = []
+    seen = seen if seen is not None else set()
+    for directory in directories:
+        try:
+            names = os.listdir(directory)
+        except OSError as exc:
+            errors.append("cannot list %s: %s" % (directory, exc))
+            continue
+        for name in names:
+            for kind, pattern in _APP_PATTERNS:
+                match = pattern.match(name)
+                if not match:
+                    continue
+                file_path = os.path.abspath(os.path.join(directory, name))
+                if file_path in seen:
+                    break
+                seen.add(file_path)
+                records.append({
+                    "frame": int(match.group(1)),
+                    "kind": kind,
+                    "path": file_path,
+                    "source": "filename",
+                })
+                break
+    return records
+
+
+def _raw_directories(root, manifest_path):
+    directories = []
+    candidates = [root]
+    if manifest_path:
+        candidates.insert(0, os.path.dirname(manifest_path))
+    if os.path.isdir(root):
+        candidates.extend([
+            os.path.join(root, "inputs"),
+            os.path.join(root, "application_inputs"),
+        ])
+    for directory in candidates:
+        directory = os.path.abspath(directory)
+        if os.path.isdir(directory) and directory not in directories:
+            directories.append(directory)
+    return directories
+
+
+def load_application_inputs(path):
+    """Load application inputs from a manifest or raw frame directory.
+
+    Accepts ``manifest.json`` itself, an oracle/capture root containing
+    ``manifest.json`` or ``application_inputs/manifest.json``, or a directory
+    of raw ``color_*.bgra`` / ``ui_*.bgra`` / ``backbuffer_*.bgra`` /
+    ``depth_*.r32f`` / ``mv_*.rg16f`` files.  A manifest whose declared paths
+    are unusable falls back to filename discovery instead of silently
+    reporting an empty inventory.  Every file that exists is hashed; missing
+    files are recorded but do not abort the inventory.
     """
     root = os.path.abspath(path)
-    manifest_path = None
-    base = root
-    if os.path.isfile(root):
-        manifest_path = root
-        base = os.path.dirname(root)
-    elif os.path.isdir(root):
-        candidate = os.path.join(root, "manifest.json")
-        if os.path.isfile(candidate):
-            manifest_path = candidate
+    manifest_path = _find_manifest(root)
+    base = os.path.dirname(manifest_path) if manifest_path else root
 
     records = []
     errors = []
@@ -276,56 +415,26 @@ def load_application_inputs(path):
         manifest = _read_json(manifest_path)
         if not isinstance(manifest, dict):
             errors.append("cannot read manifest %s" % manifest_path)
-            manifest = {}
-        for item in manifest.get("frames") or ():
-            frame = _as_int(item.get("index"))
-            if frame is None:
-                errors.append("manifest frame without an index")
-                continue
-            inputs = item.get("inputs") or {}
-            for field, kind in _MANIFEST_FIELDS:
-                relative = inputs.get(field)
-                if not relative:
-                    continue
-                file_path = os.path.join(
-                    base, str(relative).replace("/", os.sep))
-                records.append({"frame": frame, "kind": kind,
-                                "path": file_path,
-                                "source": "manifest.inputs.%s" % field})
-    else:
-        directories = []
-        if os.path.isdir(base):
-            directories.append(base)
-            nested = os.path.join(base, "inputs")
-            if os.path.isdir(nested):
-                directories.append(nested)
-        seen = set()
-        for directory in directories:
-            try:
-                names = os.listdir(directory)
-            except OSError as exc:
-                errors.append("cannot list %s: %s" % (directory, exc))
-                continue
-            for name in names:
-                for kind, pattern in _APP_PATTERNS:
-                    match = pattern.match(name)
-                    if not match:
-                        continue
-                    file_path = os.path.abspath(os.path.join(directory, name))
-                    if file_path in seen:
-                        break
-                    seen.add(file_path)
-                    records.append({
-                        "frame": int(match.group(1)),
-                        "kind": kind,
-                        "path": file_path,
-                        "source": "filename",
-                    })
-                    break
-        if not records:
+        else:
+            records = _manifest_records(manifest, base, errors)
+            if not records:
+                errors.append(
+                    "manifest %s declared no usable input records"
+                    % manifest_path)
+            elif not any(os.path.isfile(record["path"])
+                         for record in records):
+                errors.append(
+                    "manifest %s paths do not exist; falling back to raw "
+                    "filename discovery" % manifest_path)
+                records = []
+
+    if not records:
+        records = _raw_records(
+            _raw_directories(root, manifest_path), errors)
+        if not records and not manifest_path:
             errors.append(
-                "no manifest.json and no colour/ui/depth/mv files in %s"
-                % root)
+                "no manifest.json and no colour/ui/backbuffer/depth/mv files "
+                "in %s" % root)
 
     cache = {}
     by_kind = {}
@@ -493,7 +602,12 @@ def _reference_frame_map(resolved_inputs, app):
             continue
         mapping = {}
         usable = True
-        for item in resolved["per_frame"]:
+        # Missing snapshots cannot constrain this map, but remain in the report.
+        frame_items = [item for item in resolved["per_frame"]
+                       if item.get("application_frames")]
+        if not frame_items:
+            continue
+        for item in frame_items:
             candidates = item.get("application_frames") or []
             if len(candidates) != 1:
                 usable = False
@@ -601,11 +715,10 @@ def _ui_off_analysis(resolved, current_color, ui_off, reference_map=None):
     }
 
 
-def _analyse_input(resolved, app, reference_map, reference_source,
+def _analyse_input(resolved, spec, app, reference_map, reference_source,
                    trace_relation, configuration=None, current_color=None):
     """Combine alias evidence, frame matching and the trace relation."""
     name = resolved["name"]
-    spec = _INPUT_SPECS[name]
     per_frame = resolved["per_frame"]
     kind_available = bool(app and app["by_kind"].get(spec.kind))
     frame_statuses = []
@@ -753,11 +866,14 @@ def _analyse_input(resolved, app, reference_map, reference_source,
 
     frame_shift = None
     expected = spec.expected_shift
-    if status == "confirmed" and observed_shifts:
+    if status == "confirmed":
         if len(observed_shifts) == 1:
             frame_shift = next(iter(observed_shifts))
             if expected is not None and frame_shift != expected:
                 status = "mismatch"
+        elif len(observed_shifts) > 1:
+            # Unique matches must agree on the temporal offset.
+            status = "mismatch"
     if status == "frame_invariant" and expected is None:
         frame_shift = None
     if status == "mismatch":
@@ -799,14 +915,58 @@ def _d38_modes(trace):
     }
 
 
+def _select_boundary_inputs(modes):
+    """Select an observed boundary map and warn on mixed or unknown modes."""
+    distinct = set(modes.get("distinct") or ())
+    if distinct == {4}:
+        return MODE4_BOUNDARY_INPUTS, 4, None
+    if distinct and 4 in distinct:
+        return BOUNDARY_INPUTS, None, (
+            "trace mixes d38 mode 4 with %s; using the mode 1/3 boundary map"
+            % sorted(distinct - {4}))
+    unsupported = distinct - set(SUPPORTED_D38_MODES)
+    if unsupported:
+        return BOUNDARY_INPUTS, None, (
+            "d38 modes %s are not supported; using the mode 1/3 boundary map"
+            % sorted(unsupported))
+    if distinct and distinct <= set(LEGACY_D38_MODES):
+        selected = next(iter(distinct)) if len(distinct) == 1 else None
+        return BOUNDARY_INPUTS, selected, None
+    # No d38 mode constant: preserve the original mode 1/3 default.
+    return BOUNDARY_INPUTS, None, None
+
+
+def _unused_slot_evidence(trace, tensors_dir, hash_cache, app, reference_map):
+    """Describe mode 4's d38.t9 binding without calling it a UI input."""
+    spec = InputSpec("unused_d38_t9", "backbuffer", ((38, "t9"),))
+    resolved = _resolve_aliases(trace, spec, tensors_dir, hash_cache)
+    if app is not None:
+        _annotate_application_candidates(resolved, app)
+    for item in resolved["per_frame"]:
+        reference = reference_map.get(item["frame"])
+        if reference is not None:
+            item["reference_application_frame"] = reference
+    return [{
+        "slot": "d38.t9",
+        "kind": "backbuffer",
+        "reason": (
+            "mode 4 does not sample the UI slot; the binding aliases the "
+            "current backbuffer bound at d38.t10 and is not a required input"),
+        "alias_status": resolved["alias_status"],
+        "per_frame": resolved["per_frame"],
+    }]
+
+
 def build_report(trace_path, tensors_dir=None, application_inputs=None,
                  expected_lut_sha256=KNOWN_LUT_SHA256):
     """Build the provenance report for one trace.
 
     ``tensors_dir`` defaults to ``<trace dir>/tensors``.  ``application_inputs``
     is optional; without it the report still proves the slot aliases, the
-    previous/current colour relation and the LUT, and marks motion/depth frame
-    identity unresolved.
+    previous/current colour relation and the LUT, and marks inputs that need
+    frame matching unresolved.  The d38 mode actually present in the trace
+    selects the slot map, so mode 4's t8/t10 boundary does not inherit the
+    mode 1/3 UI requirement.
     """
     trace = load_trace(trace_path)
     if tensors_dir is None:
@@ -816,9 +976,12 @@ def build_report(trace_path, tensors_dir=None, application_inputs=None,
            if application_inputs else None)
     meta, meta_path = _trace_meta(trace_path)
 
+    modes = _d38_modes(trace)
+    boundary_inputs, spec_mode, mode_warning = _select_boundary_inputs(modes)
+
     hash_cache = {}
     resolved_inputs = {}
-    for spec in BOUNDARY_INPUTS:
+    for spec in boundary_inputs:
         resolved = _resolve_aliases(trace, spec, tensors_dir, hash_cache)
         if spec.name == "lut":
             resolved["expected_lut_sha256"] = expected_lut_sha256
@@ -837,9 +1000,9 @@ def build_report(trace_path, tensors_dir=None, application_inputs=None,
         configuration = meta.get("configuration") or {}
 
     inputs = {}
-    for spec in BOUNDARY_INPUTS:
+    for spec in boundary_inputs:
         inputs[spec.name] = _analyse_input(
-            resolved_inputs[spec.name], app, reference_map,
+            resolved_inputs[spec.name], spec, app, reference_map,
             reference_source, trace_relation,
             configuration=configuration,
             current_color=resolved_inputs["current_color"])
@@ -847,12 +1010,13 @@ def build_report(trace_path, tensors_dir=None, application_inputs=None,
             "missing_aliases", resolved_inputs[spec.name].get(
                 "missing_aliases", []))
 
-    modes = _d38_modes(trace)
+    unused_slots = (_unused_slot_evidence(
+        trace, tensors_dir, hash_cache, app, reference_map)
+        if spec_mode == 4 else [])
+
     warnings = []
-    if modes["distinct"] and not set(modes["distinct"]) <= set(BOUNDARY_D38_MODES):
-        warnings.append(
-            "d38 modes %s outside the profiled boundary modes %s"
-            % (modes["distinct"], list(BOUNDARY_D38_MODES)))
+    if mode_warning:
+        warnings.append(mode_warning)
     if family and family != "fg78":
         warnings.append(
             "trace family is %s; the slot map is profiled for fg78" % family)
@@ -872,6 +1036,8 @@ def build_report(trace_path, tensors_dir=None, application_inputs=None,
                      for value in inputs.values())
     if trace["errors"] or trace["duplicates"]:
         unresolved = True
+    if mode_warning:
+        unresolved = True
     alias_mismatch = any(value["alias_status"] == "mismatch"
                          for value in inputs.values())
     alias_unavailable = any(value["alias_status"] == "unavailable"
@@ -883,6 +1049,31 @@ def build_report(trace_path, tensors_dir=None, application_inputs=None,
         top_status = "partial"
     else:
         top_status = "confirmed"
+
+    if spec_mode == 4:
+        mode_notes = [
+            "Mode 4 samples d38.t8 as current hudless colour alongside "
+            "d1.t1/d25.t3/d38.t12, and d38.t10 as the current application "
+            "backbuffer.",
+            "Mode 4 requires no separate UI input; d38.t9 aliases the same "
+            "backbuffer as d38.t10 and is recorded as unused evidence, not as "
+            "a required UI input.",
+        ]
+    else:
+        mode_notes = [
+            ("d38.t9 is not an application UI input when the application UI "
+             "is off; in the profiled mode1 capture it aliases current_color."
+             if configuration.get("ui") is False else
+             "The UI texture is frame-invariant in this scene; its current or "
+             "previous identity cannot be distinguished from content."),
+        ]
+
+    reported_modes = dict(modes)
+    reported_modes.update({
+        "spec_mode": spec_mode,
+        "boundary_spec": "mode4" if spec_mode == 4 else "mode1_3",
+        "supported_modes": list(SUPPORTED_D38_MODES),
+    })
 
     return {
         "schema": SCHEMA,
@@ -897,9 +1088,10 @@ def build_report(trace_path, tensors_dir=None, application_inputs=None,
             "duplicates": trace["duplicates"],
         },
         "configuration": configuration,
-        "d38_mode": modes,
+        "d38_mode": reported_modes,
         "boundary": {
             "inputs": inputs,
+            "unused_slots": unused_slots,
             "alias_mismatch": alias_mismatch,
             "alias_unavailable": alias_unavailable,
         },
@@ -928,11 +1120,7 @@ def build_report(trace_path, tensors_dir=None, application_inputs=None,
             "transformed history buffer was observed at this boundary.",
             "motion and depth SRVs are the raw application buffers when the "
             "application-input hashes match their frame.",
-            ("d38.t9 is not an application UI input when the application UI "
-             "is off; in the profiled mode1 capture it aliases current_color."
-             if configuration.get("ui") is False else
-             "The UI texture is frame-invariant in this scene; its current or "
-             "previous identity cannot be distinguished from content."),
+        ] + mode_notes + [
             "The LUT is provider-owned (d25.t6), not an application input.",
         ],
     }

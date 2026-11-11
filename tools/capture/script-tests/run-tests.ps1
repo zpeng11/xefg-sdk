@@ -92,6 +92,33 @@ function New-SyntheticCapture {
     New-TestFile (Join-Path $trace "trace.jsonl") (($lines -join "`n") + "`n")
 }
 
+function New-ModeCapture {
+    param([string]$Root, [int]$D38Mode, [int]$MetaMode = $D38Mode)
+    # One bounded frame with the 38 captured dispatches. Only d38 carries the
+    # composite constants, and only d1 has a tensor file we ask the checker for.
+    $trace = Join-Path $Root "trace"
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $trace "tensors"))
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $trace "shaders"))
+    New-TestFile (Join-Path $trace "shaders\d1-0123456789abcdef.dxil") "dxil"
+    New-TestFile (Join-Path $trace "tensors\d0001_t0_in.bin") "tensor"
+    $meta = '{"tensor_wait":true,"tensor_wait_error":"","trace_error":"","tensor_files":1,"configuration":{"tensors":true,"width":64,"height":36,"ui_mode":' + $MetaMode + '}}'
+    New-TestFile (Join-Path $trace "meta.json") $meta
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    for ($id = 1; $id -le 38; $id++) {
+        $constants = '[]'
+        if ($id -eq 38) {
+            $values = @(0) * 15
+            $values[14] = $D38Mode
+            $constants = '[{"parameter":0,"values":[' + ($values -join ',') + ']}]'
+        }
+        $resources = '[]'
+        if ($id -eq 1) { $resources = '[{"file":"d0001_t0_in.bin"}]' }
+        $lines.Add('{"type":"dispatch","dispatch":' + $id + ',"frame":1,"constants":' + $constants + ',"resources":' + $resources + '}')
+    }
+    New-TestFile (Join-Path $trace "trace.jsonl") (($lines -join "`n") + "`n")
+}
+
 try {
     Test-Case "PowerShell parses all capture scripts" {
         foreach ($name in @("tools.ps1", "run.ps1", "disasm.ps1")) {
@@ -136,6 +163,13 @@ try {
         $run = Join-Path $script:TempRoot "run-good"
         New-SyntheticCapture -Root $run -Dispatches 2
         Assert-XefgCapture -RunDir $run -TensorDispatches 2 -Width 64 -Height 36
+    }
+
+    Test-Case "Mode verification reads d38 c[14] from the trace, not meta" {
+        $run = Join-Path $script:TempRoot "run-mode4"
+        New-ModeCapture -Root $run -D38Mode 4 -MetaMode 1
+        Assert-XefgCapture -RunDir $run -TensorDispatches 1 -Mode 4
+        Assert-Throws { Assert-XefgCapture -RunDir $run -TensorDispatches 1 -Mode 3 } "d38 c\[14\]"
     }
 
     Test-Case "Missing tensor file is rejected" {

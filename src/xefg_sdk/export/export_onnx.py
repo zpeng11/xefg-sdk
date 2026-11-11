@@ -2425,11 +2425,14 @@ def build_composite(plan, prefix=""):
                         ["cp_diff_%d" % channel])
             builder.add("Mul", ["cp_diff_%d" % channel, "cp_diff_%d" % channel],
                         ["cp_diff2_%d" % channel])
-            accum = ("cp_diff2_0" if channel == 0 else
-                     "cp_dsum_%d" % channel)
-            if channel:
-                builder.add("Add", ["cp_dsum_%d" % (channel - 1),
-                                    "cp_diff2_%d" % channel], [accum])
+            if channel == 0:
+                accum = "cp_diff2_0"
+            else:
+                previous = ("cp_diff2_0" if channel == 1 else
+                            "cp_dsum_%d" % (channel - 1))
+                accum = "cp_dsum_%d" % channel
+                builder.add("Add", [previous, "cp_diff2_%d" % channel],
+                            [accum])
         builder.add("Sqrt", [accum], ["cp_dnorm"])
         builder.const("cp_20", "fp32", 20.0)
         builder.add("Mul", ["cp_dnorm", "cp_20"], ["cp_g20"])
@@ -2442,7 +2445,8 @@ def build_composite(plan, prefix=""):
         out = []
         for channel in range(3):
             if p["mode"] == 4:
-                builder.add("Sub", [m2[channel], t8[channel]],
+                # d38 uses the final full m, not m2.
+                builder.add("Sub", [m[channel], t8[channel]],
                             ["cp_m2t8_%d" % channel])
                 builder.add("Mul", ["cp_m2t8_%d" % channel, "cp_keep"],
                             ["cp_keep_m2_%d" % channel])

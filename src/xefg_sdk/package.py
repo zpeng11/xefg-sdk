@@ -27,7 +27,7 @@ class ModelPackage:
             raise ValueError("model package contains no variants")
         self.profiles = {}
         for variant_id, variant in self.variants.items():
-            if variant.get("mode") not in (1, 3):
+            if variant.get("mode") not in (1, 3, 4):
                 raise ValueError("unsupported model mode: %s" % variant.get("mode"))
             model_path = self.path(variant["model"])
             digest = hashlib.sha256(model_path.read_bytes()).hexdigest()

@@ -1,6 +1,6 @@
 # XeFG 2x SDK quickstart
 
-This quickstart runs the Python reference SDK (API version `0.2.0`) on
+This quickstart runs the Python reference SDK (API version `0.3.0`) on
 normalized application frames. It does not need Intel's DLL, a capture trace, a
 capture dataset, or a replacement swapchain. It does need a model package,
 which this repository does not ship.
@@ -114,7 +114,8 @@ for index in (0, 1):
 
 `reset_history` is a per-frame key and defaults to `false`. A `true` value
 starts a new history in `Xefg2xSession` without pairing against the previously
-submitted frame. There is no top-level `constants` object in version 0.2.0.
+submitted frame. There is no top-level `constants` object in version 0.3.0
+(unchanged from 0.2.0).
 
 The arrays above are placeholders that match the expected shapes; a real run
 needs actual application colour, motion, depth, and UI. See
@@ -124,7 +125,13 @@ needs actual application colour, motion, depth, and UI. See
 Notes:
 
 - `AUTO` uses `HUDLESS_UITEXTURE` when both hudless colour and `ui` are present;
-  otherwise it uses `NONE` when backbuffer colour is present.
+  otherwise it uses `NONE` when backbuffer colour is present. It never selects
+  mode 4.
+- Mode 4 (`BACKBUFFER_HUDLESS`) must be requested explicitly in `config`:
+  `{"ui_mode": "BACKBUFFER_HUDLESS"}` or
+  `Config(ui_mode=UiMode.BACKBUFFER_HUDLESS)`. It uses the previous/current
+  `hudless_color` pair plus the current `backbuffer_color` (the presented
+  backbuffer with UI already composed), and does not use `ui`.
 - Inputs are normalized at the model boundary. Motion vectors must be complete
   `current_to_previous` pixel displacements on the MV grid, positive X right and
   positive Y down, including camera motion and already jitter compensated.
@@ -190,11 +197,16 @@ python -I examples/pair.py --manifest work/sequence/sequence.json --package work
 - No performance, frame-rate, latency, memory, or supported-NPU guarantee.
 - No last-bit precision promise against Intel XeFG, OptiScaler, or a captured
   reference. Historical equality was to the project's research reconstruction,
-  not the provider.
-- Only `NONE` (mode 1) and `HUDLESS_UITEXTURE` (mode 3) are implemented; other
-  public enum names parse but raise.
+  not the provider. Mode 4 is validated at 640×360 with a small remaining
+  provider residual; no equality is claimed.
+- Only `NONE` (mode 1), `HUDLESS_UITEXTURE` (mode 3), and explicit
+  `BACKBUFFER_HUDLESS` (mode 4) are implemented; other public enum names parse
+  but raise. `AUTO` still resolves only modes 1 and 3.
 - Only the profiles shipped in the package are supported. There is no
-  arbitrary-resolution or arbitrary-format promise.
+  arbitrary-resolution or arbitrary-format promise. Mode-4 profiles exist at
+  all five sizes and match the full research reconstruction exactly on both
+  frames; 640×360 used independent application images and larger sizes used
+  application-shaped arrays recovered from capture resources.
 - There is no engine adapter in this SDK. The caller or a future adapter is
   responsible for complete motion vectors, jitter compensation, and adapting
   engine depth to the fg78 raw non-inverted model contract.

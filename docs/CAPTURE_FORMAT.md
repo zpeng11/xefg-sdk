@@ -31,6 +31,13 @@ It writes a model package only to an empty output directory.
     tensors/d<dispatch>_<slot>_in.bin
     tensors/d<dispatch>_<slot>_out.bin
     disasm/<key>-<sha256-prefix>.ll
+  application_inputs/              # optional: producer --dump-inputs only
+    manifest.json
+    color_<frame>.bgra
+    ui_<frame>.bgra
+    backbuffer_<frame>.bgra
+    depth_<frame>.r32f
+    mv_<frame>.rg16f
 ```
 
 - `trace/meta.json` and `trace/trace.jsonl` are required.
@@ -39,6 +46,9 @@ It writes a model package only to an empty output directory.
   captured programs.
 - `trace/shaders/` and `trace/params/` are producer side files. They are part of
   the retained capture, but export decisions use the trace rows and tensor files.
+- `application_inputs/` is an optional provenance dump written with
+  `--dump-inputs`. It is not consumed by package export and is not the examples'
+  sequence manifest; see section 8.
 - `graph.json`, `layers.json`, `ops.json`, and other offline products may exist
   beside the required files. The exporter ignores them.
 - Resource `file` names resolve under `trace/tensors/`; shader and parameter
@@ -71,13 +81,16 @@ constant-buffer windows.
 | `xefg_family` | Provenance and compatibility signal. The profiled family is `fg78`. |
 | `xefg_dll_sha256`, `adapter`, `vendor_id`, `device_id` | Provenance only. |
 
-The producer also records `scene`, `scene_revision`, `ui`, `ui_mode`, `frames`,
-`warmup`, `pacing_ms`, `only_interpolation`, `velocity`, and `tensors` under
-`configuration`, plus counts such as `dispatches`, `tensor_files`,
-`tensor_bytes`, `provider_queues`, `tensor_wait`, and `trace_error`. The exporter
-does not interpret the UI flag or these counts when selecting a variant; the
-`d38` composite plan does that. A `frames` mismatch is a provenance warning, not
-a graph input.
+The producer also records `scene`, `scene_revision`, `ui`, `ui_mode`,
+`ui_mode_requested`, `ui_mode_explicit`, `ui_texture_tagged`,
+`initialization_fallback`, `animate_ui`, `dump_inputs`, `application_inputs`,
+`max_interpolated_frames`, `frames`, `warmup`, `pacing_ms`,
+`only_interpolation`, `velocity`, and `tensors` under `configuration`, plus
+counts such as `dispatches`, `tensor_files`, `tensor_bytes`, `provider_queues`,
+`tensor_wait`, and `trace_error`. The exporter does not interpret the UI flag or
+these counts when selecting a variant; the `d38` composite plan does that. A
+`frames` mismatch is a provenance warning, not a graph input. `ui_texture_tagged`
+is false for mode 4 because that mode does not bind a separate UI texture.
 
 `meta.json` is not a substitute for the trace. Dispatch rows and tensor files are
 still read directly.
@@ -213,15 +226,19 @@ both complete frame 1 and frame 2 snapshots.
 
 The final composite is node `d38`:
 
-- its variant mode is read from the captured composite plan, not from the
-  `meta.json` UI flag;
+- its variant mode is read from the captured composite plan (the `d38` constant
+  `c[14]`), not from the `meta.json` UI flag;
 - mode 1 folds previous colour `t11` and current colour `t12` into the graph
   that consumes the captured motion/depth-derived resources;
-- mode 3 additionally consumes UI `t9`;
-- its `u0` output is the final generated frame.
+- mode 3 additionally consumes UI `t9`, which must be present;
+- mode 4 uses the hudless previous/current pair (`t11`/`t12`) and the current
+  backbuffer `t10`; `t8` is the current hudless colour and aliases
+  `current_color`. `t9` is a bound placeholder and is not a separate UI input.
+  No UI texture is required for mode 4;
+- the composite's `u0` output is the final generated frame.
 
-Modes other than 1 and 3 are rejected even if their resource population looks
-similar.
+Modes 2 and 5 are rejected even if their resource population looks similar.
+Mode 4 is an explicit capture/export path; it is not inferred from `AUTO`.
 
 ## 5. Programs and family classification
 
@@ -260,7 +277,9 @@ The inherited research helpers contain static/motion calibrations and structural
 checks. Those checks are not universal accuracy guarantees, and successful model
 export does not certify provider equality. The SDK does not add scene-specific
 runtime error thresholds. See [Validation](VALIDATION.md) for the actual scope of
-numerical evidence.
+numerical evidence. Mode 4 has its own final-composite branch; its 640×360
+capture and `d38` mapping are checked, and the full-chained comparison retains a
+small provider residual rather than equality.
 
 ## 7. Export-time limits
 
@@ -269,7 +288,8 @@ The exporter checks the following while reading a revision 1 capture:
 - output and motion sizes must be positive and must match
   `meta.json` when those fields are present;
 - `flip_mv` must be false;
-- mode must be 1 or 3; mode 3 must have a UI `t9` input;
+- mode must be 1, 3, or 4; mode 3 must have a UI `t9` input; mode 4 must have
+  the hudless `t8` alias and the current backbuffer `t10`, and ignores `t9`;
 - colour is `uint8 (H, W, 4)`, motion is `float16 (h, w, 2)` and equals its
   float32 alias, depth is `float32 (h, w)` and equals its flat alias;
 - the gate LUT has 1024 `float32` values;
@@ -281,13 +301,60 @@ The exporter checks the following while reading a revision 1 capture:
 - inspected profiles carry 307 planner feeds, each with at most 8 values
   (285 `int64` and 22 `float32`), in addition to the 4 or 5 public application
   inputs. The serialized public graph therefore has 311 inputs for mode 1 and
-  312 for mode 3. The debug graph has 42 raw outputs. The deployable graph has
-  one output, `generated_frame`.
+  312 for mode 3. The mode-4 public model also has five public application
+  inputs, 307 planner feeds, and 312 serialized inputs across all five sizes.
+  The debug graph has 42 raw outputs. The deployable graph has one output,
+  `generated_frame`.
 
 These are export checks over retained data. They do not impose engine camera,
 jitter, or motion-vector-scale requirements on an application.
 
-## 8. Copy captures unchanged
+## 8. `application_inputs/` provenance dump
+
+`run.ps1 -DumpInputs` (native `--dump-inputs`) writes raw application inputs
+beside the trace. The dump covers **all produced application frames, including
+warmup**, not only the traced presentation frames:
+
+```text
+application_inputs/
+  manifest.json
+  color_00000.bgra
+  ui_00000.bgra
+  backbuffer_00000.bgra
+  depth_00000.r32f
+  mv_00000.rg16f
+```
+
+The producer writes one `color` (hudless colour), `ui`, `backbuffer`, `depth`,
+and `mv` file per frame. `backbuffer` is the hudless colour with the
+premultiplied UI already composited; it is the current backbuffer used by mode 4.
+The index is the application frame index including warmup.
+
+`manifest.json` declares schema `xefg.application_inputs/1` and records:
+
+| Field | Meaning |
+| --- | --- |
+| `width`, `height` | Output colour dimensions. |
+| `motion_width`, `motion_height` | Half-resolution motion/depth grid. |
+| `frame_count`, `first_frame`, `last_frame` | Dumped range; currently `0..frame_count-1`. |
+| `includes_warmup` | `true`; the dump is not limited to traced frames. |
+| `warmup`, `traced_frames` | The `-Warmup` / `-Frames` values used for the run. |
+| `formats` | `color`/`ui`/`backbuffer` are `BGRA8`; `depth` is `R32_FLOAT`; `motion` is `R16G16_FLOAT`. |
+| `frames` | Per-frame `index` and relative `inputs` file names. |
+
+All files are raw, tightly packed, little-endian on Windows x64, and relative to
+`application_inputs/`. The manifest is a provenance description of the producer's
+scene, **not** the examples' sequence manifest (`schema_version: 1` with
+`frames[].path` or `frames[].fields`). Converting a dump for `examples/pair.py`
+or `examples/sequence.py` requires building a separate sequence manifest and
+mapping these files to the example field names.
+
+The package exporter does not consume `application_inputs/`; the separate
+input-provenance report can read it. It is useful for independent
+application-input inference, provenance, and re-checking outputs. Copy it with
+the rest of the run as read-only evidence; see section 9.
+
+## 9. Copy captures unchanged
 
 Copy an entire run directory as a unit. Do not:
 

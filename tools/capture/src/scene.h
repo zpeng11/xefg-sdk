@@ -24,6 +24,9 @@ struct SceneOptions
     float velocityY = 4.0f;
 
     bool ui = true;
+    // Move the crosshair per frame so the captured UI is not frame-invariant.
+    // Off by default: every byte of the default scene stays unchanged.
+    bool animateUi = false;
     // XeFG expects current -> previous; flip only for diagnosing sign conventions.
     bool flipMotionVectors = false;
     uint32_t frameIndex = 0;
@@ -52,5 +55,5 @@ struct SceneFrame
 void GenerateScene(const SceneOptions& options, SceneFrame& frame);
 
 uint16_t FloatToHalf(float value);
-void WriteRawFile(const std::wstring& path, const void* data, size_t bytes);
+bool WriteRawFile(const std::wstring& path, const void* data, size_t bytes);
 } // namespace oracle

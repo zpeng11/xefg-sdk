@@ -26,7 +26,8 @@ python -m pip install ".[export,ort]"  # both
 
 The distribution is named `xefg-sdk`; the Python package is `xefg_sdk`.
 These are local installation instructions, not a claim of a published PyPI release.
-API version remains **0.2.0**, model-package schema remains **1**.
+API version is **0.3.0**; model-package schema is **1**. See
+[compatibility](docs/COMPATIBILITY.md) for supported modes and older packages.
 
 ## Capture source data (optional, Windows)
 
@@ -40,10 +41,10 @@ powershell -NoProfile -File tools/capture/run.ps1 `
 ```
 
 Replace the SDK path with your own and choose a new/empty output directory.
-Use `-Mode 1` for the no-UI path. The runner builds, captures, and disassembles;
-it does not run a model export implicitly. See the
-[capture guide](docs/CAPTURE_GUIDE.md) for prerequisites and the complete two-mode
-sequence. This tool is separate from pip installation and is not in the wheel.
+The runner builds, captures, and disassembles; export is a separate step.
+Use `-Mode 1`, `3`, or `4` to select the UI mode described below. See the
+[capture guide](docs/CAPTURE_GUIDE.md) for prerequisites and capture options.
+This tool is built separately from the Python package and is not in the wheel.
 
 ## Export a model package
 
@@ -90,9 +91,20 @@ with Xefg2xRuntime.load("/data/model_package") as runtime:
 Colours are `uint8 (H, W, 4)`. Motion is `float16 (h, w, 2)` (float32 is also
 accepted with `RG32_FLOAT`); depth is `float32 (h, w)`. Current profiles use
 `h=H/2`, `w=W/2`. The dimensions must match a profile in the supplied package.
-Mode 3 uses `hudless_color` instead of `backbuffer_color` and adds current
-premultiplied `ui`. `Xefg2xSession.submit(frame)` owns previous-frame snapshots and
-honours `FrameInputs.reset_history`.
+
+All modes use the current frame's motion/depth; their colour inputs differ:
+
+| Mode | Previous/current colour pair | Additional current-frame input |
+| --- | --- | --- |
+| 1 — `NONE` | `backbuffer_color` | None; UI is interpolated with the image |
+| 3 — `HUDLESS_UITEXTURE` | `hudless_color` | Premultiplied `ui` |
+| 4 — `BACKBUFFER_HUDLESS` | `hudless_color` | `backbuffer_color` with UI already composed |
+
+`AUTO` selects mode 3 when a hudless pair and UI are available, otherwise mode 1
+from a backbuffer pair. Select mode 4 explicitly with
+`Config(ui_mode=UiMode.BACKBUFFER_HUDLESS)`; it needs no separate UI texture.
+`Xefg2xSession.submit(frame)` retains previous-frame snapshots and honours
+`FrameInputs.reset_history`.
 
 **The engine/adapter owns coordinate adaptation.** Motion must already contain
 complete current-to-previous displacement in MV-grid pixels, including camera
@@ -108,16 +120,17 @@ see [the executor protocol](docs/MODEL_PACKAGE.md#7-runtime-use).
 
 ## Scope
 
-- 2x midpoint interpolation; UI modes 1 (`NONE`) and 3 (`HUDLESS_UITEXTURE`).
-- Captured profile coverage: 640×360, 1280×720, 1920×1080, 2560×1440, and
-  3840×2160 in both modes, with half-resolution motion/depth. These are
+- 2x midpoint interpolation with UI modes 1, 3, and 4.
+- Five output sizes in each mode: 640×360, 1280×720, 1920×1080, 2560×1440,
+  and 3840×2160, with half-resolution motion/depth. These are
   [reproducible profiles](docs/PROFILES.md), not bundled model assets.
 - Exact profile selection, not arbitrary-resolution planning.
 - Standard ONNX opset 18 / IR 8. Backend support for the mixed integer/float
   operator set must be checked; ONNX alone does not guarantee NPU compatibility.
 - No engine adapter, presentation scheduling, HDR path, or performance guarantee.
-- Packaging preserves the research graph; it does not eliminate the known
-  numerical differences from original XeFG. See [validation](docs/VALIDATION.md).
+- Packaging preserves the research implementation, including its known
+  numerical differences from original XeFG. See [validation](docs/VALIDATION.md)
+  for measured results and their scope.
 
 ## Develop and test
 
@@ -128,10 +141,9 @@ python -m pip install -e ".[test]"
 python -I -B -m unittest discover -s tests -v
 ```
 
-Capture integration tests are skipped unless explicit capture paths are provided
-through `XEFG_SDK_MODE3_RUN`, `XEFG_SDK_MODE1_RUN`, and
-`XEFG_SDK_MODE3_SIZE_RUN`. There are no machine-specific dataset defaults.
-No captures are needed for the synthetic unit tests or tiny real-ORT smoke test.
+Synthetic unit tests and the small real-ORT smoke test need no captures.
+Capture integration tests are opt-in, with no machine-specific dataset defaults.
+See [development](docs/DEVELOPMENT.md) for fixture paths and native-tool tests.
 
 ```text
 src/xefg_sdk/          public runtime API, package loader, planner, executors

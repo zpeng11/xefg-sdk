@@ -43,6 +43,7 @@ struct Options
     bool staticScene = false;
     std::string scene = "standard";
     bool ui = true;
+    bool animateUi = false;
     std::string uiMode = "auto";
     float velocityX = 12.0f;
     float velocityY = 4.0f;
@@ -54,6 +55,7 @@ struct Options
     bool modelDump = true;
     bool showInterpolationOnly = true;
     bool tensors = false;
+    bool dumpInputs = false;
     uint32_t tensorBudgetMB = 512;
     uint32_t tensorDispatches = 0;
 };
@@ -115,9 +117,11 @@ void Usage()
         "  --velocity X,Y          object displacement per frame in output pixels\n"
         "  --scene standard|smooth  grid/checker or gradients (default standard)\n"
         "  --ui on|off             tag a UI texture (default on)\n"
-        "  --ui-mode auto|none|hudless-uitexture (default auto)\n"
+        "  --ui-mode auto|none|hudless-uitexture|backbuffer-hudless (default auto)\n"
+        "  --animate-ui            move the synthetic UI crosshair per frame\n"
         "  --flip-mv               opposite motion-vector sign convention\n"
         "  --tensors               snapshot bound tensors around each dispatch\n"
+        "  --dump-inputs           write raw application inputs to application_inputs/\n"
         "  --tensor-budget-mb N    tensor snapshot budget (default 512)\n"
         "  --tensor-dispatches N   snapshot only the first N traced dispatches\n"
         "  --all-presents          do not enable SHOW_ONLY_INTERPOLATION\n"
@@ -159,9 +163,22 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error)
         else if (argument == "--warmup") options.warmup = std::stoul(value(i, argument));
         else if (argument == "--pacing-ms") options.pacingMilliseconds = std::stoul(value(i, argument));
         else if (argument == "--ui") options.ui = EqualsIgnoreCase(value(i, argument), "on");
-        else if (argument == "--ui-mode") options.uiMode = value(i, argument);
+        else if (argument == "--ui-mode")
+        {
+            const std::string mode = value(i, argument);
+            if (!EqualsIgnoreCase(mode, "auto") && !EqualsIgnoreCase(mode, "none")
+                && !EqualsIgnoreCase(mode, "hudless-uitexture")
+                && !EqualsIgnoreCase(mode, "backbuffer-hudless"))
+            {
+                error = "--ui-mode expects auto, none, hudless-uitexture, or backbuffer-hudless";
+                return false;
+            }
+            options.uiMode = mode;
+        }
+        else if (argument == "--animate-ui") options.animateUi = true;
         else if (argument == "--flip-mv") options.flipMotionVectors = true;
         else if (argument == "--tensors") options.tensors = true;
+        else if (argument == "--dump-inputs") options.dumpInputs = true;
         else if (argument == "--tensor-budget-mb") options.tensorBudgetMB = std::stoul(value(i, argument));
         else if (argument == "--tensor-dispatches") options.tensorDispatches = std::stoul(value(i, argument));
         else if (argument == "--all-presents") options.showInterpolationOnly = false;
@@ -271,6 +288,81 @@ bool Submit(WarpFixture& fixture)
     return fixture.SignalAndWait();
 }
 
+bool WriteApplicationInputs(const std::filesystem::path& directory, uint32_t frame,
+    const oracle::SceneFrame& scene, std::string& error)
+{
+    const auto write = [&](const wchar_t* prefix, const wchar_t* extension,
+                           const void* data, size_t bytes) -> bool {
+        wchar_t name[64]{};
+        swprintf_s(name, L"%s_%05u.%s", prefix, frame, extension);
+        const std::filesystem::path path = directory / name;
+        if (!oracle::WriteRawFile(path.wstring(), data, bytes))
+        {
+            error = "could not write application input " + path.string();
+            return false;
+        }
+        return true;
+    };
+    return write(L"color", L"bgra", scene.hudlessColor.data(), scene.hudlessColor.size())
+        && write(L"ui", L"bgra", scene.uiColor.data(), scene.uiColor.size())
+        && write(L"backbuffer", L"bgra", scene.backbuffer.data(), scene.backbuffer.size())
+        && write(L"depth", L"r32f", scene.depth.data(), scene.depth.size() * sizeof(float))
+        && write(L"mv", L"rg16f", scene.motion.data(), scene.motion.size() * sizeof(uint16_t));
+}
+
+bool WriteApplicationInputsManifest(const std::filesystem::path& directory, const Options& options,
+    uint32_t motionWidth, uint32_t motionHeight, uint32_t totalFrames, std::string& error)
+{
+    const std::filesystem::path path = directory / L"manifest.json";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file)
+    {
+        error = "could not write application input manifest " + path.string();
+        return false;
+    }
+    file << "{\n";
+    file << "  \"schema\": \"xefg.application_inputs/1\",\n";
+    file << "  \"width\": " << options.width << ",\n";
+    file << "  \"height\": " << options.height << ",\n";
+    file << "  \"motion_width\": " << motionWidth << ",\n";
+    file << "  \"motion_height\": " << motionHeight << ",\n";
+    file << "  \"frame_count\": " << totalFrames << ",\n";
+    file << "  \"first_frame\": 0,\n";
+    file << "  \"last_frame\": " << (totalFrames ? totalFrames - 1u : 0u) << ",\n";
+    file << "  \"includes_warmup\": true,\n";
+    file << "  \"warmup\": " << options.warmup << ",\n";
+    file << "  \"traced_frames\": " << options.frames << ",\n";
+    file << "  \"frame_semantics\": \"index is the application frame including warmup; "
+            "color is the hudless color, backbuffer is the premultiplied UI over it\",\n";
+    file << "  \"formats\": {\"color\": \"BGRA8\", \"ui\": \"BGRA8\", \"backbuffer\": \"BGRA8\", "
+            "\"depth\": \"R32_FLOAT\", \"motion\": \"R16G16_FLOAT\"},\n";
+    file << "  \"frames\": [\n";
+    for (uint32_t frame = 0; frame < totalFrames; ++frame)
+    {
+        const auto name = [frame](const char* prefix, const char* extension) {
+            char text[64]{};
+            std::snprintf(text, sizeof(text), "%s_%05u.%s", prefix, frame, extension);
+            return std::string(text);
+        };
+        file << "    {\"index\": " << frame << ", \"inputs\": {"
+             << "\"color\": \"" << name("color", "bgra") << "\", "
+             << "\"ui\": \"" << name("ui", "bgra") << "\", "
+             << "\"backbuffer\": \"" << name("backbuffer", "bgra") << "\", "
+             << "\"depth\": \"" << name("depth", "r32f") << "\", "
+             << "\"motion\": \"" << name("mv", "rg16f") << "\"}}"
+             << (frame + 1u < totalFrames ? "," : "") << "\n";
+    }
+    file << "  ]\n";
+    file << "}\n";
+    file.flush();
+    if (!file.good())
+    {
+        error = "could not write application input manifest " + path.string();
+        return false;
+    }
+    return true;
+}
+
 void CALLBACK LogCallback(const char* message, xefg_swapchain_logging_level_t level, void* userData)
 {
     static_cast<oracle::Runtime*>(userData)->AppendLog(message, static_cast<int>(level));
@@ -312,6 +404,18 @@ int main(int argc, char** argv)
     const std::filesystem::path outputDirectory = Widen(options.outputDirectory);
     std::error_code filesystemError;
     std::filesystem::create_directories(outputDirectory / L"trace", filesystemError);
+
+    const std::filesystem::path applicationInputsDirectory = outputDirectory / L"application_inputs";
+    if (options.dumpInputs)
+    {
+        std::filesystem::create_directories(applicationInputsDirectory, filesystemError);
+        if (!std::filesystem::is_directory(applicationInputsDirectory))
+        {
+            std::fprintf(stderr, "application input directory unavailable: %s\n",
+                applicationInputsDirectory.string().c_str());
+            return 1;
+        }
+    }
 
     probe::TraceWriter trace;
     if (!trace.Open(outputDirectory / L"trace", error))
@@ -462,28 +566,40 @@ int main(int argc, char** argv)
         runtime.xefgSwapChainSetLatencyReduction(fg, xell);
     }
 
+    const bool uiModeExplicit = !EqualsIgnoreCase(options.uiMode, "auto");
     xefg_swapchain_ui_mode_t uiMode = XEFG_SWAPCHAIN_UI_MODE_AUTO;
     if (EqualsIgnoreCase(options.uiMode, "none")) uiMode = XEFG_SWAPCHAIN_UI_MODE_NONE;
     else if (EqualsIgnoreCase(options.uiMode, "hudless-uitexture")) uiMode = XEFG_SWAPCHAIN_UI_MODE_HUDLESS_UITEXTURE;
-    if (!options.ui) uiMode = XEFG_SWAPCHAIN_UI_MODE_NONE;
+    else if (EqualsIgnoreCase(options.uiMode, "backbuffer-hudless"))
+        uiMode = XEFG_SWAPCHAIN_UI_MODE_BACKBUFFER_HUDLESS;
+    if (!uiModeExplicit && !options.ui) uiMode = XEFG_SWAPCHAIN_UI_MODE_NONE;
+
+    // Mode 4 interpolates the hudless color and extracts UI from the swap-chain
+    // backbuffer, so it tags hudless color but never a UI texture.
+    const bool sceneUi = options.ui && uiMode != XEFG_SWAPCHAIN_UI_MODE_NONE;
+    const bool tagUi = sceneUi && uiMode != XEFG_SWAPCHAIN_UI_MODE_BACKBUFFER_HUDLESS;
+    options.ui = sceneUi;
 
     xefg_swapchain_d3d12_init_params_t initParameters{};
     initParameters.pApplicationSwapChain = nullptr;
     initParameters.initFlags = 0;
     initParameters.maxInterpolatedFrames = 1;
     initParameters.uiMode = uiMode;
+    bool initializationFallback = false;
     result = runtime.xefgSwapChainD3D12InitFromSwapChainDesc(fg, window.window, &chainDescription, nullptr,
         fixture.queue.Get(), captureFactory.Get(), &initParameters);
     if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
     {
+        // Retry with the maximum interpolation count but never silently switch
+        // an explicit UI mode to AUTO: the requested mode is part of the run.
+        initializationFallback = true;
         initParameters.maxInterpolatedFrames = XEFG_SWAPCHAIN_USE_MAX_SUPPORTED_INTERPOLATED_FRAMES;
-        initParameters.uiMode = XEFG_SWAPCHAIN_UI_MODE_AUTO;
         result = runtime.xefgSwapChainD3D12InitFromSwapChainDesc(fg, window.window, &chainDescription, nullptr,
             fixture.queue.Get(), captureFactory.Get(), &initParameters);
     }
     if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
     {
-        std::fprintf(stderr, "XeFG initialization failed: %d\n", int(result));
+        std::fprintf(stderr, "XeFG initialization failed for UI mode %d: %d\n", int(uiMode), int(result));
         return 1;
     }
 
@@ -502,8 +618,9 @@ int main(int argc, char** argv)
 
     xefg_swapchain_properties_t properties{};
     runtime.xefgSwapChainD3D12GetProperties(fg, &initParameters, 0, 0, DXGI_FORMAT_UNKNOWN, &properties);
-    std::printf("XeFG ready: maxInterpolations=%u descriptors=%u\n",
-        properties.maxSupportedInterpolations, properties.requiredDescriptorCount);
+    std::printf("XeFG ready: uiMode=%d maxInterpolations=%u descriptors=%u fallback=%s\n",
+        int(uiMode), properties.maxSupportedInterpolations, properties.requiredDescriptorCount,
+        initializationFallback ? "yes" : "no");
 
     const uint32_t motionWidth = options.highResMotionVectors ? options.width
         : std::min(options.motionWidth, options.width);
@@ -522,7 +639,6 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "input texture creation failed\n");
         return 1;
     }
-    options.ui = options.ui && uiMode != XEFG_SWAPCHAIN_UI_MODE_NONE;
 
     const uint32_t totalFrames = options.warmup + options.frames;
     for (uint32_t frame = 0; frame < totalFrames; ++frame)
@@ -541,11 +657,22 @@ int main(int argc, char** argv)
         sceneOptions.velocityX = options.velocityX;
         sceneOptions.velocityY = options.velocityY;
         sceneOptions.ui = options.ui;
+        sceneOptions.animateUi = options.animateUi;
         sceneOptions.flipMotionVectors = options.flipMotionVectors;
         sceneOptions.frameIndex = frame;
 
         oracle::SceneFrame scene;
         oracle::GenerateScene(sceneOptions, scene);
+
+        if (options.dumpInputs)
+        {
+            std::string dumpError;
+            if (!WriteApplicationInputs(applicationInputsDirectory, frame, scene, dumpError))
+            {
+                std::fprintf(stderr, "application input dump failed: %s\n", dumpError.c_str());
+                return 1;
+            }
+        }
 
         if (!fixture.SubmitAndWait())
         {
@@ -608,11 +735,18 @@ int main(int argc, char** argv)
         if (options.ui)
         {
             if (tag(XEFG_SWAPCHAIN_RES_HUDLESS_COLOR, colorTexture.Get(), options.width, options.height)
-                    != XEFG_SWAPCHAIN_RESULT_SUCCESS
-                || tag(XEFG_SWAPCHAIN_RES_UI, uiTexture.Get(), options.width, options.height)
-                    != XEFG_SWAPCHAIN_RESULT_SUCCESS)
+                != XEFG_SWAPCHAIN_RESULT_SUCCESS)
             {
-                std::fprintf(stderr, "color/UI tagging failed at frame %u\n", frame);
+                std::fprintf(stderr, "hudless color tagging failed at frame %u\n", frame);
+                return 1;
+            }
+        }
+        if (tagUi)
+        {
+            if (tag(XEFG_SWAPCHAIN_RES_UI, uiTexture.Get(), options.width, options.height)
+                != XEFG_SWAPCHAIN_RESULT_SUCCESS)
+            {
+                std::fprintf(stderr, "UI tagging failed at frame %u\n", frame);
                 return 1;
             }
         }
@@ -648,6 +782,17 @@ int main(int argc, char** argv)
         if (options.pacingMilliseconds) Sleep(options.pacingMilliseconds);
     }
 
+    if (options.dumpInputs)
+    {
+        std::string manifestError;
+        if (!WriteApplicationInputsManifest(applicationInputsDirectory, options, motionWidth, motionHeight,
+            totalFrames, manifestError))
+        {
+            std::fprintf(stderr, "application input manifest failed: %s\n", manifestError.c_str());
+            return 1;
+        }
+    }
+
     capture->SetEnabled(false);
     fixture.SignalAndWait();
     proxy.Reset(); // destroys the provider context and joins its threads
@@ -663,12 +808,20 @@ int main(int argc, char** argv)
     meta << "  \"device_id\": " << selectedDescription.DeviceId << ",\n";
     meta << "  \"xefg_family\": \"" << probe::JsonEscape(family) << "\",\n";
     meta << "  \"xefg_dll_sha256\": \"" << moduleHash << "\",\n";
+    meta << "  \"application_inputs\": " << (options.dumpInputs ? "true" : "false") << ",\n";
     meta << "  \"configuration\": {\"width\": " << options.width << ", \"height\": " << options.height
          << ", \"motion_width\": " << motionWidth << ", \"motion_height\": " << motionHeight
          << ", \"scene\": \"" << options.scene << "\", \"scene_revision\": 1"
          << ", \"static\": " << (options.staticScene ? "true" : "false")
          << ", \"ui\": " << (options.ui ? "true" : "false")
+         << ", \"ui_texture_tagged\": " << (tagUi ? "true" : "false")
          << ", \"ui_mode\": " << int(uiMode)
+         << ", \"ui_mode_requested\": \"" << probe::JsonEscape(options.uiMode) << "\""
+         << ", \"ui_mode_explicit\": " << (uiModeExplicit ? "true" : "false")
+         << ", \"max_interpolated_frames\": " << initParameters.maxInterpolatedFrames
+         << ", \"initialization_fallback\": " << (initializationFallback ? "true" : "false")
+         << ", \"animate_ui\": " << (options.animateUi ? "true" : "false")
+         << ", \"dump_inputs\": " << (options.dumpInputs ? "true" : "false")
          << ", \"frames\": " << options.frames << ", \"warmup\": " << options.warmup
          << ", \"pacing_ms\": " << options.pacingMilliseconds
          << ", \"only_interpolation\": " << (options.showInterpolationOnly ? "true" : "false")

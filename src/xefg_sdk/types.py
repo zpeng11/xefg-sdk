@@ -6,6 +6,7 @@ import numpy as np
 
 
 class UiMode(IntEnum):
+    """UI composition mode; AUTO selects NONE or HUDLESS_UITEXTURE."""
     AUTO = 0
     NONE = 1
     BACKBUFFER_UITEXTURE = 2
@@ -50,7 +51,9 @@ class FrameInputs:
     Motion includes camera/object motion, in current-to-previous MV-grid pixel
     units with jitter already compensated. Depth follows the model package's
     raw, non-inverted convention; the SDK does not linearize or rescale it.
-    Mode 3 UI is premultiplied. Engine matrices/scales/flags are not inputs.
+    Mode 1 uses backbuffer colour; modes 3/4 use hudless colour. Composition
+    uses current premultiplied UI in mode 3, or the current backbuffer in mode 4.
+    Engine matrices/scales/flags are not inputs.
     """
     frame_id: int
     backbuffer_color: ImageView | None = None

@@ -1,5 +1,92 @@
 # Validation status
 
+## Version 0.3.0 mode-4 validation — 2026-11-10
+
+The mode-4 (`BACKBUFFER_HUDLESS`) path is now captured at 640×360, 1280×720,
+1920×1080, 2560×1440, and 3840×2160. Each run retained **420 tensor files** and
+46 shader disassemblies, with complete tensor frames 1 and 2, `tensor_wait` true,
+and an empty `trace_error`. The 640×360 runs used 320×180 MV/depth and covered
+both the standard scene and `-AnimateUi`.
+
+The captured `d38` input mapping is confirmed: `t8` is the current hudless colour
+and aliases `current_color`, `t10` is the current backbuffer, and `t9` remains a
+bound placeholder that mode 4 does not consume. No separate UI texture is bound.
+
+Two previously unvalidated mode-4 issues were corrected: the ONNX distance sum
+referenced a nonexistent `cp_dsum_0`, and the final blend used intermediate `m2`
+instead of the shader's full blend `m`. Captured DXIL and numerical replay
+established the latter correction. The corrected graph matches captured `d38`
+individually with **0 differing bytes**
+on frames 1 and 2 for both standard and animated UI. The corrected full chained
+graph, compared with the provider capture, records:
+
+| Scene | Frame | Differing bytes | Max delta |
+| --- | ---: | ---: | ---: |
+| standard | 1 | 12 | 1 |
+| standard | 2 | 8 | 1 |
+| animated UI | 1 | 12 | 1 |
+| animated UI | 2 | 8 | 1 |
+
+That is a small residual, not provider equality; differences originating at
+`d25` propagate through the downstream graph. Mode-1 and mode-3 deployment model
+hashes were unchanged by the mode-4 fix.
+
+At 640×360, four runtime outputs (standard and animated UI, frames 1 and 2)
+matched the full research reconstruction with 0 differing bytes. The 15-profile
+export is confirmed: all five mode-4 sizes use the same ONNX model SHA-256
+`b42f93a76a97a32bc03636b86206a06449fea787a12a35e8979217cbf815bca0`,
+and all frame-2 mode-4 profiles are identical to their frame-1 profiles. The
+mode-1 and mode-3 model and profile objects are unchanged. The full Python suite
+passed **83/83** with all capture environment variables enabled.
+
+The raw mode-4 graph has 320 serialized inputs and 6039 nodes before public
+packaging. The packaged model has 6045 nodes, 312 serialized inputs (five
+application resources plus 307 profile feeds), and one output.
+
+The remaining mode-4 sizes were also executed through both the SDK and full
+reconstruction for frames 1 and 2:
+
+| Output | Frame | SDK vs full reconstruction: bytes | SDK vs provider: bytes / max delta |
+| --- | ---: | ---: | ---: |
+| 1280x720 | 1 | 0 | 47 / 1 |
+| 1280x720 | 2 | 0 | 24 / 1 |
+| 1920x1080 | 1 | 0 | 3805 / 27 |
+| 1920x1080 | 2 | 0 | 29 / 1 |
+| 2560x1440 | 1 | 0 | 3545 / 23 |
+| 2560x1440 | 2 | 0 | 44 / 1 |
+| 3840x2160 | 1 | 0 | 26 / 1 |
+| 3840x2160 | 2 | 0 | 2282 / 25 |
+
+For these larger-size comparisons, application-shaped arrays were reconstructed
+from captured external resources. They validate packaging and execution, but
+are not independent application-input provenance tests. The separate 640x360
+runs use ordinary application-side images dumped directly by `GenerateScene`.
+Capture access and exporter imports were blocked in those runtime processes.
+The default scene's application bytes for frames 0..2 match the prior baseline.
+
+Initial failed composite measurements were retained before the formula fix;
+no retries or output patches were used to hide differences. Provenance reports
+remain `partial` for complete traces because frames 3..5 have no tensor dumps;
+the retained frames 1/2 establish the current backbuffer/hudless identities.
+
+## Installed v0.3.0 wheel validation — 2026-11-10
+
+A non-editable v0.3.0 wheel was installed into a separate environment and
+checked:
+
+| Check | Result |
+| --- | --- |
+| Unit tests | 65 passed; 5 classes and 1 test skipped |
+| Integration tests | 83/83 passed; zero skips |
+| Capture tool | CTest 1/1; 12 script checks passed |
+| Installed pure export, ORT imports blocked | All 15 profiles passed |
+| Installed application runtime | Four generated frames exact |
+| Pair and sequence examples | Three NPY outputs match; three PNGs written |
+
+ORT imports were blocked for the export check. The application runtime used the
+installed wheel and application inputs; all four generated frames matched the
+full reconstruction.
+
 ## Standalone validation — 2026-11-10
 
 This repository was split from `MFG-Unlocker` at commit `3d67197`. Its wheel was
@@ -167,4 +254,9 @@ capture that satisfies [Capture format](CAPTURE_FORMAT.md).
 The historical evidence and standalone preservation checks support this claim:
 for the inspected frames and profiles, the SDK package and input preparation
 preserve the project's existing full reconstruction. They do not support claims
-of provider byte-exactness, arbitrary-resolution coverage, or NPU support.
+of provider byte-exactness, arbitrary-resolution coverage, or NPU support. The
+mode-4 addition is validated at 640×360 in both standard and animated-UI scenes;
+its full-chain provider comparison has a small residual. All five mode-4 sizes
+are captured and packaged and match the full research reconstruction exactly on
+both frames at every size (640×360 with independent application images; larger
+sizes with application-shaped arrays recovered from capture resources).

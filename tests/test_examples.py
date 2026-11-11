@@ -56,6 +56,33 @@ class ExampleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "normalized inputs"):
                 common.open_sequence(args)
 
+    def test_backbuffer_hudless_manifest_keeps_current_frame_fields(self):
+        from xefg_sdk import UiMode
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            np.savez(root / "frame.npz", frame_id=np.int64(7),
+                     backbuffer_color=np.full((2, 4, 4), 9, np.uint8),
+                     hudless_color=np.full((2, 4, 4), 8, np.uint8),
+                     ui=np.full((2, 4, 4), 7, np.uint8),
+                     motion_vectors=np.ones((1, 2, 2), np.float16),
+                     depth=np.full((1, 2), 100.0, np.float32))
+            path = root / "sequence.json"
+            path.write_text(json.dumps({
+                "schema_version": 1, "package": "model",
+                "config": {"ui_mode": "BACKBUFFER_HUDLESS"},
+                "frames": [{"path": "frame.npz"}],
+            }), encoding="utf-8")
+            args = argparse.Namespace(manifest=str(path), ui_mode=None,
+                                      profile=None, package=None)
+            defaults, entries, _package = common.open_sequence(args)
+            self.assertEqual(defaults.config.ui_mode,
+                             UiMode.BACKBUFFER_HUDLESS)
+            frame = common.load_frame(entries[0], defaults)
+            self.assertIsNotNone(frame.hudless_color)
+            self.assertIsNotNone(frame.backbuffer_color)
+            self.assertIsNotNone(frame.ui)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

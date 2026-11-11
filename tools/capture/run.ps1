@@ -7,8 +7,10 @@ trace, and disassembles the captured DXIL.
 .DESCRIPTION
 OutDir defaults to a new unique directory under the system temporary directory.
 BuildDir defaults to $env:TEMP\xefg-sdk-capture-build and may be reused.
-Use -Mode 1 for UI off (XEFG_SWAPCHAIN_UI_MODE_NONE) or -Mode 3 for hudless
-colour plus UI (XEFG_SWAPCHAIN_UI_MODE_HUDLESS_UITEXTURE).
+Use -Mode 1 for UI off (XEFG_SWAPCHAIN_UI_MODE_NONE), -Mode 3 for hudless
+colour plus UI (XEFG_SWAPCHAIN_UI_MODE_HUDLESS_UITEXTURE), or -Mode 4 for
+hudless colour with UI extracted from the uploaded backbuffer
+(XEFG_SWAPCHAIN_UI_MODE_BACKBUFFER_HUDLESS).
 
 The capture always enables trace and tensor snapshots. It deliberately skips the
 provider model-catalog dump because export only needs trace rows, shader/parameter
@@ -22,7 +24,7 @@ param(
     [string]$CMake = "",
     [string]$Dxc = "",
     [string]$Adapter = "",
-    [ValidateSet(1, 3)][int]$Mode = 3,
+    [ValidateSet(1, 3, 4)][int]$Mode = 3,
     [ValidateRange(2, 2147483647)][int]$Width = 640,
     [ValidateRange(2, 2147483647)][int]$Height = 360,
     [ValidateRange(1, 2147483647)][int]$Frames = 2,
@@ -30,6 +32,8 @@ param(
     [string]$Velocity = "12,4",
     [ValidateSet("standard", "smooth")][string]$Scene = "standard",
     [switch]$Static,
+    [switch]$AnimateUi,
+    [switch]$DumpInputs,
     [ValidateRange(1, 2147483647)][int]$TensorDispatches = 76,
     [ValidateRange(0, 2147483647)][int]$TensorBudgetMB = 0
 )
@@ -155,6 +159,11 @@ $captureArguments = @(
 if ($Mode -eq 3) {
     $captureArguments += @("--ui", "on", "--ui-mode", "hudless-uitexture")
 }
+elseif ($Mode -eq 4) {
+    # Mode 4 interpolates hudless colour and extracts UI from the backbuffer we
+    # already upload; the probe must not tag a separate UI texture.
+    $captureArguments += @("--ui", "on", "--ui-mode", "backbuffer-hudless")
+}
 else {
     $captureArguments += @("--ui", "off", "--ui-mode", "none")
 }
@@ -164,11 +173,17 @@ if ($adapterFilter) {
 if ($Static) {
     $captureArguments += "--static"
 }
+if ($AnimateUi) {
+    $captureArguments += "--animate-ui"
+}
+if ($DumpInputs) {
+    $captureArguments += "--dump-inputs"
+}
 
 Write-Host ""
 Write-Host "Capture configuration:"
 Write-Host "  adapter:  $(if ($adapterFilter) { $adapterFilter } else { '<first hardware>' })"
-Write-Host "  mode:     $Mode"
+Write-Host "  mode:     $Mode$(if ($AnimateUi) { ', animated UI' } else { '' })$(if ($DumpInputs) { ', dump inputs' } else { '' })"
 Write-Host "  output:   ${Width}x${Height}, motion/depth ${motionWidth}x${motionHeight}"
 Write-Host "  scene:    $Scene$(if ($Static) { ', static' } else { '' })"
 Write-Host "  frames:   $Frames after $Warmup warmup frame(s)"
@@ -183,7 +198,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ""
 Write-Host "Checking capture metadata and requested tensor frames..."
-Assert-XefgCapture -RunDir $outDirPath -TensorDispatches $TensorDispatches -Width $Width -Height $Height
+Assert-XefgCapture -RunDir $outDirPath -TensorDispatches $TensorDispatches -Width $Width -Height $Height -Mode $Mode
 
 Write-Host "Disassembling captured programs..."
 try {

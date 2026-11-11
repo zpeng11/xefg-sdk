@@ -114,8 +114,17 @@ void RenderUi(const SceneOptions& options, std::vector<uint8_t>& output)
 {
     output.assign(static_cast<size_t>(options.width) * options.height * 4, 0);
     if (!options.ui) return;
-    const float cx = options.width * 0.5f;
-    const float cy = options.height * 0.5f;
+    float cx = options.width * 0.5f;
+    float cy = options.height * 0.5f;
+    if (options.animateUi)
+    {
+        // A small, deterministic crosshair motion: visible per frame, bounded
+        // for the default sizes, and applied only to the UI/backbuffer inputs.
+        const uint32_t phase = options.frameIndex % 8u;
+        const uint32_t vertical = (options.frameIndex / 8u) % 6u;
+        cx += (static_cast<float>(phase) - 3.5f) * 4.0f;
+        cy += (static_cast<float>(vertical) - 2.5f) * 3.0f;
+    }
     for (uint32_t y = 0; y < options.height; ++y)
     {
         for (uint32_t x = 0; x < options.width; ++x)
@@ -240,10 +249,13 @@ void GenerateScene(const SceneOptions& options, SceneFrame& frame)
     RenderDepthAndMotion(options, frame);
 }
 
-void WriteRawFile(const std::wstring& path, const void* data, size_t bytes)
+bool WriteRawFile(const std::wstring& path, const void* data, size_t bytes)
 {
+    if (!data && bytes) return false;
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file) return;
+    if (!file) return false;
     file.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+    file.flush();
+    return file.good();
 }
 } // namespace oracle

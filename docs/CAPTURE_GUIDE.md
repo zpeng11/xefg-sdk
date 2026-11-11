@@ -47,7 +47,7 @@ A matching public header version is not a promise that every provider build has
 the same internal layout. Capture metadata records the actual DLL hash/family.
 No SDK headers, binaries, or generated program/model data are bundled or fetched.
 
-## 2. Capture both SDK modes
+## 2. Capture the required SDK modes
 
 Run PowerShell from the checkout root. Choose a work directory outside the source
 checkout with enough free disk space. Each capture output must be new or empty;
@@ -64,7 +64,20 @@ powershell -NoProfile -File tools/capture/run.ps1 `
 powershell -NoProfile -File tools/capture/run.ps1 `
   -XessSdkRoot $sdk -OutDir "$work/mode3" -BuildDir "$work/build" `
   -Mode 3 -Width 640 -Height 360
+
+powershell -NoProfile -File tools/capture/run.ps1 `
+  -XessSdkRoot $sdk -OutDir "$work/mode4" -BuildDir "$work/build" `
+  -Mode 4 -Width 640 -Height 360
 ```
+
+Mode 4 captures the hudless colour pair and uses the current presented
+backbuffer as its UI carrier; no separate UI texture is bound. `-AnimateUi`
+moves the synthetic UI crosshair per frame, which is useful for checking that
+the UI is taken from the intended frame. `-DumpInputs` additionally writes raw
+`color`/`ui`/`backbuffer`/`depth`/`mv` files plus an
+`application_inputs/manifest.json` for all frames, including warmup. That dump
+is provenance data for independent inference; it is not the examples' sequence
+manifest. See [Capture format](CAPTURE_FORMAT.md#8-application_inputs-provenance-dump).
 
 Use `-Adapter "6800"`, for example, to select a matching adapter description on a
 multi-GPU machine; without an explicit selector the tool chooses an eligible
@@ -85,7 +98,10 @@ for `xefg-export`; see [Capture format](CAPTURE_FORMAT.md).
 
 ### Defaults and supported configuration
 
-- `-Mode 1`: UI off (`NONE`); `-Mode 3`: hudless colour + UI (`HUDLESS_UITEXTURE`).
+- `-Mode 1`: UI off (`NONE`); `-Mode 3`: hudless colour + separate UI
+  (`HUDLESS_UITEXTURE`); `-Mode 4`: hudless colour + current backbuffer
+  (`BACKBUFFER_HUDLESS`), with UI composed in the backbuffer and no UI texture
+  tagged.
 - `-Width 640 -Height 360`; MV/depth dimensions are always half each axis.
   Output dimensions must be positive and even.
 - `-Frames 2 -Warmup 4 -Velocity "12,4" -Scene standard`.
@@ -93,6 +109,11 @@ for `xefg-export`; see [Capture format](CAPTURE_FORMAT.md).
   frames. Trace metadata can include later frames without tensor snapshots.
 - `-Static` selects a stationary scene; `-Scene smooth` selects the inherited
   smooth-content scene. Neither changes the core SDK's application contract.
+- `-AnimateUi` moves the synthetic UI crosshair by a small deterministic offset
+  per frame. It is off by default, so the default scene bytes are unchanged.
+- `-DumpInputs` writes `application_inputs/` for every produced frame, including
+  warmup. The package exporter does not consume it; it is a provenance format
+  for independent input checks and is not the examples' sequence manifest.
 - `-TensorBudgetMB` can explicitly set the readback/dump budget. The automatic
   budget scales from 6144 MB at 4K, with a 512 MB floor and 6144 MB cap, for the
   default two-frame retention. Increase it explicitly when retaining more data.
@@ -106,6 +127,9 @@ requires enough provider frames and memory/disk budget; incomplete captures fail
 For another supported profile, change output dimensions (720p, 1080p, 1440p or
 3840×2160). Larger captures consume substantial memory/disk and are not included
 in the source repository. Keep each mode/size in its own output directory.
+Mode-1 and mode-3 captures exist for all five sizes. Mode-4 captures and
+profiles also exist for all five sizes; SDK outputs match the full
+reconstruction exactly on both frames at every size.
 
 ## 3. Export
 
@@ -113,25 +137,32 @@ Install the Python exporter once from this checkout:
 
 ```powershell
 python -m pip install ".[export,ort]"
-xefg-export --runs "$work/mode1,$work/mode3" --out "$work/package"
+xefg-export --runs "$work/mode1,$work/mode3,$work/mode4" --out "$work/package"
 ```
 
-The package contains two variants and two profiles for this example. Add more
-compatible captures to `--runs` to build a larger profile registry. Use `--frame 2`
-to rebuild from the second retained tensor frame, or `--debug` for diagnostic
-graph outputs. The package output directory must be absent or empty.
+The package contains three variants and a profile for each supplied mode/size
+combination. Add more compatible captures to `--runs` to build a larger profile
+registry. Use `--frame 2` to rebuild from the second retained tensor frame, or
+`--debug` for diagnostic graph outputs. The package output directory must be
+absent or empty.
 
 Export does not run the provider or call the capture tool automatically. A
 successful export is not a promise of provider byte-exactness or arbitrary-size
-support. See [Validation](VALIDATION.md) and [Profiles](PROFILES.md).
+support. Mode-4 profiles exist at all five sizes and match the full research
+reconstruction exactly on both frames. The 640×360 checks use independent
+application images; larger-size checks use application-shaped arrays recovered
+from capture resources. Provider comparisons remain nonzero, so no equality is
+claimed. See [Validation](VALIDATION.md) and [Profiles](PROFILES.md).
 
 ## 4. Runtime
 
 Only the exported package is needed by an application. Capture data, original
 DLLs and the C++ toolchain are not runtime dependencies. Use the
 [quickstart](QUICKSTART.md) and [input contract](IO_CONTRACT.md) to provide ordinary
-application colour/MV/depth/UI arrays. Engine-side coordinate adaptation remains
-the caller's responsibility.
+application colour/MV/depth arrays, plus UI for mode 3 or the current backbuffer
+for mode 4. Mode 4 must be selected explicitly with
+`Config(ui_mode=UiMode.BACKBUFFER_HUDLESS)`; `AUTO` still resolves only to mode 1
+or mode 3. Engine-side coordinate adaptation remains the caller's responsibility.
 
 ## Build and scene tests without capture
 

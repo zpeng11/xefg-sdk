@@ -3,7 +3,8 @@
 ## Source separation
 
 This repository is the standalone XeFG 2x SDK extracted from
-`MFG-Unlocker` at commit `3d67197` (2026-11-10).
+`MFG-Unlocker` at commit `3d67197` (2026-11-10). The current API version is
+`0.3.0`; the model-package schema is `1`.
 
 | Area | Location |
 | --- | --- |
@@ -64,10 +65,19 @@ python -I examples/pair.py --manifest work/sequence/sequence.json --package work
 python -I examples/sequence.py --manifest work/sequence/sequence.json --package work/model_package --output work/out
 ```
 
-Capture integration tests are opt-in through `XEFG_SDK_MODE3_RUN`,
-`XEFG_SDK_MODE1_RUN`, and `XEFG_SDK_MODE3_SIZE_RUN`; the default synthetic tests
-need no captures. The standalone installed-package checks and historical source
-evidence are recorded in [Validation](VALIDATION.md).
+Synthetic tests need no captures. Integration tests use explicit fixture paths:
+
+| Environment variable | Capture fixture |
+| --- | --- |
+| `XEFG_SDK_MODE1_RUN` | Mode 1, half-resolution MV/depth |
+| `XEFG_SDK_MODE3_RUN` | Mode 3, 640x360 |
+| `XEFG_SDK_MODE3_SIZE_RUN` | Mode 3 at another size, for cross-size comparison |
+| `XEFG_SDK_MODE4_RUN` | Mode 4, 640x360 |
+| `XEFG_SDK_MODE4_ANIMATED_RUN` | Mode 4, 640x360 with animated UI |
+| `XEFG_MODE4_CAPTURE` | Mode 4 with `application_inputs/`, for provenance |
+
+Unset variables skip the corresponding tests; invalid configured paths fail.
+See [Validation](VALIDATION.md) for results and fixture coverage.
 
 ## Optional native tool tests
 
@@ -90,11 +100,11 @@ See [Capture guide](CAPTURE_GUIDE.md) for the real capture/export sequence.
 - [Quickstart](QUICKSTART.md): install, create application inputs, run examples.
 - [IO contract](IO_CONTRACT.md): `FrameInputs`, formats, profiles, errors.
 - [Model package](MODEL_PACKAGE.md): package layout, manifest, graph inputs.
-- [Profiles](PROFILES.md): supported size/mode combinations.
+- [Profiles](PROFILES.md): supported mode/size combinations, including mode-4 sizes.
 - [Capture guide](CAPTURE_GUIDE.md): optional Windows build, capture and export.
 - [Capture format](CAPTURE_FORMAT.md): capture/export contract revision 1.
-- [Compatibility](COMPATIBILITY.md): semantic scope and non-guarantees.
-- [Validation](VALIDATION.md): current status and historical source evidence.
+- [Compatibility](COMPATIBILITY.md): semantic scope, version history, and non-guarantees.
+- [Validation](VALIDATION.md): mode-4 results, current status, and historical source evidence.
 
 ## Licensing
 

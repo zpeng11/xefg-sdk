@@ -11,6 +11,10 @@ verified external resource aliases into a small public input contract:
                                            unjittered)
     depth           FLOAT  [Hm, Wm]       (raw, non-inverted)
     ui              UINT8  [H, W, 4]      (mode 3 only, premultiplied)
+    backbuffer      UINT8  [H, W, 4]      (mode 4 only, current colour with UI)
+
+Mode 1 uses the backbuffer colour pair; modes 3 and 4 use the hudless pair.
+Composition uses current `ui` in mode 3 or current `backbuffer` in mode 4.
 
 This is a *normalized* model input contract.  The caller converts its raw
 engine/API conventions (camera transforms, jitter offsets, motion-vector units
@@ -69,6 +73,15 @@ ALIASES = {
         "depth": ("n0024_x1", "n0025_x4"),
         "ui": ("n0038_in_t9",),
     },
+    4: {
+        # d38.t9 is bound but unused; only t10 exposes the backbuffer.
+        "previous_color": ("n0001_x0", "n0025_x1", "n0038_in_t11"),
+        "current_color": ("n0001_x1", "n0025_x2", "n0038_in_t12",
+                          "n0038_in_t8"),
+        "motion_vectors": ("n0024_x0", "n0025_x3"),
+        "depth": ("n0024_x1", "n0025_x4"),
+        "backbuffer": ("n0038_in_t10",),
+    },
 }
 
 PUBLIC_INPUTS = {
@@ -84,6 +97,13 @@ PUBLIC_INPUTS = {
         ("motion_vectors", TensorProto.FLOAT16, ["Hm", "Wm", 2]),
         ("depth", TensorProto.FLOAT, ["Hm", "Wm"]),
         ("ui", TensorProto.UINT8, ["H", "W", 4]),
+    ),
+    4: (
+        ("previous_color", TensorProto.UINT8, ["H", "W", 4]),
+        ("current_color", TensorProto.UINT8, ["H", "W", 4]),
+        ("motion_vectors", TensorProto.FLOAT16, ["Hm", "Wm", 2]),
+        ("depth", TensorProto.FLOAT, ["Hm", "Wm"]),
+        ("backbuffer", TensorProto.UINT8, ["H", "W", 4]),
     ),
 }
 
@@ -128,8 +148,9 @@ REFERENCES = [
 ]
 
 LIMITATIONS = [
-    "v0.1 supports only the normalized XeFG input contract: BGRA8_UNORM "
-    "color/UI, RG16_FLOAT half-resolution MV-grid pixel-space MV "
+    "The exporter supports only the normalized XeFG input contract: "
+    "BGRA8_UNORM color, mode 3 premultiplied UI, mode 4 current backbuffer, "
+    "RG16_FLOAT half-resolution MV-grid pixel-space MV "
     "(current_to_previous), raw non-inverted R32_FLOAT depth, full rect and "
     "2x midpoint interpolation.",
     "The model consumes normalized inputs: motion vectors already expressed "
@@ -140,14 +161,15 @@ LIMITATIONS = [
     "matrices or a particular engine-side MV scale.  The splat scale is baked "
     "into an initializer; the warp motion scale and temporal ratio are "
     "profile-fixed graph inputs.",
-    "mode 1 and mode 3 only; modes 2/4/5 and AUTO are not exported.  mode 3 "
-    "requires premultiplied UI.",
+    "mode 1, 3 and 4 only; modes 2/5 and AUTO are not exported.  mode 3 "
+    "requires premultiplied UI; mode 4 consumes the current backbuffer and "
+    "does not take a separate UI texture.",
     "Only the profiles listed in manifest.json are supported.  Shape, phase, "
     "padding and allocation scalars are profile-fixed; shape feeds are "
-    "profile-based in v0.1.",
+    "profile-based.",
     "The package contains no captured frames, features, reference outputs or "
     "static/motion calibration tables.  The runtime must supply the "
-    "application colors, MV, depth and (mode 3) UI.",
+    "application colors, MV, depth and the mode 3 UI or mode 4 backbuffer.",
     "The optional debug model exposes all 42 raw assembled outputs for "
     "investigation only and is not a stable deployment contract.",
     "Model assets (weights, quantisation constants and the gate LUT) are "
@@ -164,6 +186,8 @@ _SEMANTIC_DESCRIPTION = {
                        "current_to_previous, unjittered"),
     "depth": "Current-frame raw, non-inverted R32F depth on the MV grid",
     "ui": "Premultiplied BGRA8 UI for mode 3",
+    "backbuffer": ("Current application backbuffer with UI already composed, "
+                   "BGRA8; mode 4 only"),
 }
 
 _CONFIG_SEMANTIC = {
@@ -372,9 +396,9 @@ def _require(condition, message):
 def _plan_mode(specs, run_dir):
     """The exported variant comes from the final composite plan."""
     plan_mode = specs[38]["plan"].get("mode")
-    if plan_mode not in (1, 3):
+    if plan_mode not in (1, 3, 4):
         raise ExportError(
-            "%s: unsupported final composite mode %r (v0.1 exports 1 and 3)"
+            "%s: unsupported final composite mode %r (exports 1, 3 and 4)"
             % (run_dir, plan_mode))
     return int(plan_mode)
 
@@ -412,14 +436,19 @@ def build_capture(run_dir, frame=1):
     capture.motion_size = (int(feeds["n0024_x0"].shape[0]),
                            int(feeds["n0024_x0"].shape[1]))
     capture.has_ui = "n0038_in_t9" in assembler.cut_inputs
+    capture.has_backbuffer = "n0038_in_t10" in assembler.cut_inputs
 
     # The composite plan, not the metadata UI flag, defines the exported
-    # variant.  Other UI modes (2/4/5) must not be relabelled as mode 1/3 even
-    # when their t9 presence happens to look similar.
+    # variant.  Other UI modes (2/5) must not be relabelled as mode 1/3/4 even
+    # when their t9/t10 presence happens to look similar.
     capture.mode = _plan_mode(specs, run_dir)
     if capture.mode == 3 and not capture.has_ui:
         raise ExportError(
             "%s: mode 3 composite has no UI input" % run_dir)
+    if capture.mode == 4 and not capture.has_backbuffer:
+        raise ExportError(
+            "%s: mode 4 composite has no current backbuffer input"
+            % run_dir)
 
     _validate_capture(capture)
     return capture
@@ -442,7 +471,7 @@ def _validate_capture(capture):
                 "%s: meta %s=%s does not match the captured feed %s"
                 % (capture.run_dir, key, config[key], expected))
     if config.get("flip_mv"):
-        raise ExportError("%s: flip_mv is not supported in v0.1"
+        raise ExportError("%s: flip_mv is not supported"
                           % capture.run_dir)
 
     # The alias groups are the verified resource identities.  Byte/bit
@@ -506,6 +535,14 @@ def _validate_capture(capture):
             _require(ui.shape == (height, width, 4),
                      "%s: UI shape %s, expected %s"
                      % (capture.run_dir, ui.shape, (height, width, 4)))
+        elif public == "backbuffer":
+            backbuffer = _canonical_array(feeds[names[0]])
+            _require(backbuffer.dtype == np.uint8,
+                     "%s: backbuffer is not uint8" % capture.run_dir)
+            _require(backbuffer.shape == (height, width, 4),
+                     "%s: backbuffer shape %s, expected %s"
+                     % (capture.run_dir, backbuffer.shape,
+                        (height, width, 4)))
 
     lut = _canonical_array(feeds[LUT_INPUT])
     _require(lut.dtype == np.float32,
@@ -539,11 +576,11 @@ def _validate_canonical_configuration(capture):
     motion_scale = scalar("n0025_wi_motion_scale")
     ratio = scalar("n0025_wi_ratio")
     if not np.isclose(motion_scale, 4.0, rtol=0.0, atol=1e-6):
-        raise ExportError("%s: unsupported MV scale %r (v0.1 expects 4.0)"
+        raise ExportError("%s: unsupported MV scale %r (expects 4.0)"
                           % (capture.run_dir, motion_scale))
     if not np.isclose(ratio, 1.0, rtol=0.0, atol=1e-6):
         raise ExportError("%s: unsupported interpolation ratio %r "
-                          "(v0.1 expects 1.0)" % (capture.run_dir, ratio))
+                          "(expects 1.0)" % (capture.run_dir, ratio))
 
     height, width = capture.output_size
     lo_x = scalar("n0025_wi_lo_ax")
@@ -610,7 +647,7 @@ def rewrite_graph(model, feeds, mode, want_debug=False):
     graph output under its original name.
     """
     if mode not in ALIASES:
-        raise ExportError("unsupported mode %r (v0.1 exports 1 and 3)" % mode)
+        raise ExportError("unsupported mode %r (exports 1, 3 and 4)" % mode)
     aliases = ALIASES[mode]
     alias_names = set()
     for group in aliases.values():
@@ -805,7 +842,7 @@ def _configuration(mode):
         "interpolation_factor": 2,
         "interpolation_position": 0.5,
         "ui_premultiplied": True,
-        "ui_enabled": mode == 3,
+        "ui_enabled": mode in (3, 4),
         "baked": {
             "splat_scale": [0.5, 0.5],
         },

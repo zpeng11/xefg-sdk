@@ -43,13 +43,16 @@ def color_data(view):
 def resolve_mode(previous: FrameInputs, current: FrameInputs, config: Config):
     mode = UiMode(config.ui_mode)
     if mode == UiMode.AUTO:
+        # Keep implicit selection stable; mode 4 requires an explicit choice.
         if previous.hudless_color is not None and current.hudless_color is not None and current.ui is not None:
             return UiMode.HUDLESS_UITEXTURE
         if previous.backbuffer_color is not None and current.backbuffer_color is not None:
             return UiMode.NONE
         raise ValueError("AUTO needs a hudless pair plus UI, or a backbuffer pair")
-    if mode not in (UiMode.NONE, UiMode.HUDLESS_UITEXTURE):
-        raise ValueError("only NONE and HUDLESS_UITEXTURE models are supported")
+    if mode not in (UiMode.NONE, UiMode.HUDLESS_UITEXTURE,
+                    UiMode.BACKBUFFER_HUDLESS):
+        raise ValueError("only NONE, HUDLESS_UITEXTURE and "
+                         "BACKBUFFER_HUDLESS models are supported")
     return mode
 
 
@@ -59,7 +62,7 @@ def prepare_inputs(previous: FrameInputs, current: FrameInputs, config: Config):
     if current.frame_id <= previous.frame_id:
         raise ValueError("current frame_id must follow previous frame_id")
     mode = resolve_mode(previous, current, config)
-    field = "hudless_color" if mode == UiMode.HUDLESS_UITEXTURE else "backbuffer_color"
+    field = "backbuffer_color" if mode == UiMode.NONE else "hudless_color"
     old_color = color_data(getattr(previous, field))
     new_color = color_data(getattr(current, field))
     if old_color.shape != new_color.shape:
@@ -78,4 +81,9 @@ def prepare_inputs(previous: FrameInputs, current: FrameInputs, config: Config):
         if ui.shape != new_color.shape:
             raise ValueError("UI must match colour dimensions")
         values["ui"] = ui
+    elif mode == UiMode.BACKBUFFER_HUDLESS:
+        backbuffer = color_data(current.backbuffer_color)
+        if backbuffer.shape != new_color.shape:
+            raise ValueError("backbuffer must match the hudless colour dimensions")
+        values["backbuffer"] = backbuffer
     return mode, values

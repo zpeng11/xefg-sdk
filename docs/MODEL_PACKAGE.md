@@ -5,9 +5,10 @@ A model package is the deployable, language-neutral input to
 metadata. It contains no application frames, capture feeds, expected outputs,
 or debug trace tensors as inference dependencies.
 
-This document describes API version `0.2.0`. The model-package schema is `1`.
-Packages produced for version 0.1 remain compatible; they need no migration or
-model rebuild. The exporter writes the manifest and profile files from retained
+This document describes API version `0.3.0`. The model-package schema is `1`.
+Packages produced for versions 0.1 and 0.2 remain compatible; they need no
+migration or model rebuild. A runtime older than 0.3.0 rejects a mode-4 variant
+as unsupported. The exporter writes the manifest and profile files from retained
 captures, and those generated files are authoritative.
 
 **This repository ships source only. It does not contain ONNX models, weights,
@@ -26,13 +27,19 @@ xefg2x-package/
   models/
     mode1.onnx
     mode3.onnx
+    mode4.onnx
   profiles/
     mode1-1280x720-mv640x360.json
     mode3-1280x720-mv640x360.json
+    mode4-640x360-mv320x180.json
   debug/                         # optional: --debug only
     mode1.onnx
     mode1.outputs.json
 ```
+
+A package contains the variants that were exported. A mode-4 model and its
+profiles are optional; they are present only when mode-4 captures were supplied
+to the exporter.
 
 `io_contract.json` is written by the exporter as provenance and is ignored by
 the runtime. `debug/` is optional and is never required to deploy.
@@ -86,6 +93,22 @@ directory. Paths that resolve outside the package are rejected.
       "profiles": [
         "profiles/mode3-1280x720-mv640x360.json"
       ]
+    },
+    "mode4": {
+      "mode": 4,
+      "model": "models/mode4.onnx",
+      "model_sha256": "<64 hex characters>",
+      "inputs": [
+        "previous_color",
+        "current_color",
+        "motion_vectors",
+        "depth",
+        "backbuffer"
+      ],
+      "output": "generated_frame",
+      "profiles": [
+        "profiles/mode4-640x360-mv320x180.json"
+      ]
     }
   }
 }
@@ -93,7 +116,8 @@ directory. Paths that resolve outside the package are rejected.
 
 The exporter also writes `source` and `limitations`; the runtime ignores them.
 A variant may list several profiles for different output/motion sizes. The
-exported variant IDs are `mode1` and `mode3`.
+exported variant IDs are `mode1`, `mode3`, and (when mode-4 captures are
+supplied) `mode4`.
 
 `conventions` describes the required **model-boundary** representation that any
 caller or engine adapter must supply. It is not a description of raw engine
@@ -105,15 +129,17 @@ metadata and it is validated by the runtime:
 - the runtime uses these values to reject a package whose boundary does not
   match the implementation.
 
-The conventions are part of schema `1`. Version 0.1 packages that carry the
-same values remain valid.
+The conventions are part of schema `1`. Version 0.1 and 0.2 packages that carry
+the same values remain valid. Mode 4 does not change the schema: it adds a
+variant with `mode: 4`, the five public inputs shown below, and a model that
+consumes the current composed backbuffer.
 
 Validation performed by `ModelPackage`:
 
 - `schema_version` must be `1`;
 - every manifest convention must match the required model-boundary value;
 - `variants` must be a non-empty object;
-- every variant `mode` must be `1` or `3`;
+- every variant `mode` must be `1`, `3`, or `4`;
 - the model file exists and its SHA-256 matches `model_sha256`;
 - every profile is readable, has `schema_version: 1`, and declares the same
   variant ID;
@@ -127,11 +153,16 @@ The package exposes only these application resources to the model:
 | --- | --- | --- |
 | 1 | `NONE` | `previous_color`, `current_color`, `motion_vectors`, `depth` |
 | 3 | `HUDLESS_UITEXTURE` | `previous_color`, `current_color`, `motion_vectors`, `depth`, `ui` |
+| 4 | `BACKBUFFER_HUDLESS` | `previous_color`, `current_color`, `motion_vectors`, `depth`, `backbuffer` |
 
-That is four tensors in mode 1 and five in mode 3. Colours and UI are
+That is four tensors in mode 1 and five in modes 3 and 4. Colours and UI are
 `BGRA8_UNORM` `uint8 (H, W, 4)`; motion vectors are `float16 (h, w, 2)` after
 the SDK's single precision conversion; depth is raw fg78 non-inverted
 `float32 (h, w)` (smaller is nearer).
+
+Mode 4's `previous_color` and `current_color` are the hudless pair. `backbuffer`
+is the current presented backbuffer with UI already composited; it is not a UI
+texture, and mode 4 has no `ui` input and no previous-backbuffer input.
 
 The variant's `inputs` set must exactly equal the resources selected by the UI
 mode. The SDK does not rename public resources to `dN.tN` slots. Internal
@@ -143,7 +174,9 @@ graph input count. In the inspected packages the public graph has 311 inputs for
 mode 1 and 312 for mode 3: the 4 or 5 public image inputs plus the 307
 profile-fixed metadata feeds. Those 307 feeds break down as 285 `int64` and 22
 `float32` scalars, pads, shapes, and allocation constants. They are supplied by
-the profile, not by the application, and they are not capture tensors.
+the profile, not by the application, and they are not capture tensors. The
+mode-4 public model has five public inputs, 307 feeds, and 312 serialized inputs
+across all five sizes.
 
 The package boundary is already normalized: motion vectors are complete
 `current_to_previous` pixel displacements on the motion-vector grid, with
@@ -211,8 +244,12 @@ Zero matches or multiple matches raise. This is deliberate: the SDK does not
 guess a nearby profile or resample to an arbitrary resolution.
 
 Profile metadata is imported from the exporter. Formula-generated profiles are
-future work. Version 0.2.0 supports the known profiles present in the package
-and makes no arbitrary-resolution claim.
+future work. Version 0.3.0 supports the known profiles present in the package
+and makes no arbitrary-resolution claim. Mode-4 profiles exist at all five sizes
+through 4K and are included in the 15-profile package. SDK outputs match the full
+reconstruction exactly on both frames at every size; 640×360 used independent
+application images, and larger sizes used application-shaped arrays recovered
+from capture resources.
 
 ## 5. Final output and optional debug outputs
 
@@ -265,7 +302,8 @@ with Xefg2xRuntime.load("model_package") as runtime:
 
 A frame pair carries only `FrameInputs`; there is no constants object. History
 is owned by `Xefg2xSession.submit(frame)` and its per-frame `reset_history`
-flag.
+flag. Mode 4 is selected by an explicit `Config(ui_mode=UiMode.BACKBUFFER_HUDLESS)`;
+`AUTO` still chooses only modes 1 and 3.
 
 The executor protocol is small:
 
