@@ -290,6 +290,13 @@ bool IsCutResetFrame(uint32_t frame, SceneKind scene)
     return scene == SceneKind::Cut && frame == kCutFrame;
 }
 
+bool IsValidPairFrame(SceneKind scene, uint32_t pairFrame)
+{
+    if (pairFrame < 1) return false;
+    // Pair [pairFrame - 1, pairFrame] crosses the cut only when it is [6, 7].
+    return !(scene == SceneKind::Cut && pairFrame == kCutFrame);
+}
+
 Matrix4 IdentityMatrix()
 {
     return Mat(1, 0, 0, 0,
@@ -381,6 +388,7 @@ FrameState MakeFrameState(SceneKind scene, uint32_t frame, bool midpoint)
 {
     FrameState state{};
     state.scene = scene;
+    state.sourceFrame = frame;
     state.frame = frame;
     state.midpoint = midpoint;
     state.time = midpoint ? static_cast<float>(frame) - 0.5f : static_cast<float>(frame);
@@ -424,6 +432,23 @@ FrameState MakeFrameState(SceneKind scene, uint32_t frame, bool midpoint)
         char name[16]{};
         std::snprintf(name, sizeof(name), "rod%d", i);
         AddObject(state, name, MeshKind::Rod, rod, rod, rodColor);
+    }
+    return state;
+}
+
+FrameState MakeIsolatedPairFrameState(SceneKind scene, uint32_t sourceFrame,
+    bool firstOfPair, bool midpoint)
+{
+    FrameState state = MakeFrameState(scene, sourceFrame, midpoint);
+    if (firstOfPair && !state.historyReset)
+    {
+        state.historyReset = true;
+        state.previousTime = state.time;
+        state.previousView = state.view;
+        state.previousProjection = state.projection;
+        state.previousViewProjection = state.viewProjection;
+        for (uint32_t i = 0; i < state.objectCount; ++i)
+            state.objects[i].previousWorld = state.objects[i].world;
     }
     return state;
 }
@@ -480,6 +505,7 @@ struct Renderer::Impl
     TargetSet midpointTargets;
     TargetSet* activeTargets = nullptr;
 
+    RenderSize size;
     FrameState state;
     bool midpointActive = false;
     bool ready = false;
@@ -600,15 +626,15 @@ struct Renderer::Impl
     {
         targets.rtvBase = rtvBase;
         targets.srvBase = srvBase;
-        targets.color = CreateTexture(kColorWidth, kColorHeight, kColorFormat,
+        targets.color = CreateTexture(size.width, size.height, kColorFormat,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE, error);
-        targets.ui = CreateTexture(kColorWidth, kColorHeight, kColorFormat,
+        targets.ui = CreateTexture(size.width, size.height, kColorFormat,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE, error);
-        targets.backbuffer = CreateTexture(kColorWidth, kColorHeight, kColorFormat,
+        targets.backbuffer = CreateTexture(size.width, size.height, kColorFormat,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE, error);
-        targets.depth = CreateTexture(kGeometryWidth, kGeometryHeight, kDepthFormat,
+        targets.depth = CreateTexture(size.GeometryWidth(), size.GeometryHeight(), kDepthFormat,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE, error);
-        targets.motion = CreateTexture(kGeometryWidth, kGeometryHeight, kMotionFormat,
+        targets.motion = CreateTexture(size.GeometryWidth(), size.GeometryHeight(), kMotionFormat,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE, error);
         if (!targets.color || !targets.ui || !targets.backbuffer || !targets.depth || !targets.motion)
             return false;
@@ -794,9 +820,10 @@ struct Renderer::Impl
 
     bool CreateDepthTargets(std::string& error)
     {
-        colorDepth = CreateTexture(kColorWidth, kColorHeight, DXGI_FORMAT_D32_FLOAT,
+        colorDepth = CreateTexture(size.width, size.height, DXGI_FORMAT_D32_FLOAT,
             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, error);
-        geometryDepth = CreateTexture(kGeometryWidth, kGeometryHeight, DXGI_FORMAT_D32_FLOAT,
+        geometryDepth = CreateTexture(size.GeometryWidth(), size.GeometryHeight(),
+            DXGI_FORMAT_D32_FLOAT,
             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, error);
         if (!colorDepth || !geometryDepth) return false;
 
@@ -816,11 +843,17 @@ struct Renderer::Impl
     }
 
     bool Initialize(ID3D12Device* inputDevice, ID3D12CommandQueue* inputQueue,
-        const std::filesystem::path& shaderPath, std::string& error)
+        const std::filesystem::path& shaderPath, std::string& error, RenderSize renderSize)
     {
         if (!inputDevice || !inputQueue)
         {
             error = "device and queue are required";
+            return false;
+        }
+        if (renderSize.width < 2 || renderSize.height < 2
+            || (renderSize.width % 2) != 0 || (renderSize.height % 2) != 0)
+        {
+            error = "render size must be at least 2x2 with even width and height";
             return false;
         }
 
@@ -835,6 +868,7 @@ struct Renderer::Impl
 
         device = inputDevice;
         queue = inputQueue;
+        size = renderSize;
 
         HRESULT hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
             IID_PPV_ARGS(&allocator));
@@ -927,14 +961,14 @@ struct Renderer::Impl
             sizeof(constants.viewProjection));
         std::memcpy(constants.previousViewProjection, frameState.previousViewProjection.m,
             sizeof(constants.previousViewProjection));
-        constants.viewport[0] = static_cast<float>(kColorWidth);
-        constants.viewport[1] = static_cast<float>(kColorHeight);
-        constants.viewport[2] = static_cast<float>(kGeometryWidth);
-        constants.viewport[3] = static_cast<float>(kGeometryHeight);
+        constants.viewport[0] = static_cast<float>(size.width);
+        constants.viewport[1] = static_cast<float>(size.height);
+        constants.viewport[2] = static_cast<float>(size.GeometryWidth());
+        constants.viewport[3] = static_cast<float>(size.GeometryHeight());
         constants.frameData[0] = static_cast<float>(frameState.uiFrameId);
         constants.frameData[1] = frameState.midpoint ? 1.0f : 0.0f;
         constants.frameData[2] = frameState.historyReset ? 1.0f : 0.0f;
-        constants.frameData[3] = static_cast<float>(frameState.scene);
+        constants.frameData[3] = frameState.uiEnabled ? 1.0f : 0.0f;
         std::memcpy(frameConstantMapped, &constants, sizeof(constants));
         commandList->SetGraphicsRootConstantBufferView(1,
             frameConstantBuffer->GetGPUVirtualAddress());
@@ -1014,12 +1048,12 @@ struct Renderer::Impl
         const float motionClear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         const float uiClear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-        // Color pass at 640x360, depth tested with the full-resolution depth.
+        // Color pass at the output size, depth tested with the full-resolution depth.
         {
             D3D12_CPU_DESCRIPTOR_HANDLE rtv = RtvCpu(targets.rtvBase + 0);
             commandList->OMSetRenderTargets(1, &rtv, FALSE, &colorDepthDsv);
-            D3D12_VIEWPORT viewport = Viewport(kColorWidth, kColorHeight);
-            D3D12_RECT scissor = Scissor(kColorWidth, kColorHeight);
+            D3D12_VIEWPORT viewport = Viewport(size.width, size.height);
+            D3D12_RECT scissor = Scissor(size.width, size.height);
             commandList->RSSetViewports(1, &viewport);
             commandList->RSSetScissorRects(1, &scissor);
             commandList->ClearRenderTargetView(rtv, colorClear, 0, nullptr);
@@ -1029,13 +1063,13 @@ struct Renderer::Impl
             DrawObjects(frameState, false);
         }
 
-        // Geometry pass at 320x180, writing normalised depth and motion.
+        // Geometry pass at half output size, writing normalised depth and motion.
         {
             D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {
                 RtvCpu(targets.rtvBase + 3), RtvCpu(targets.rtvBase + 4)};
             commandList->OMSetRenderTargets(2, rtvs, FALSE, &geometryDepthDsv);
-            D3D12_VIEWPORT viewport = Viewport(kGeometryWidth, kGeometryHeight);
-            D3D12_RECT scissor = Scissor(kGeometryWidth, kGeometryHeight);
+            D3D12_VIEWPORT viewport = Viewport(size.GeometryWidth(), size.GeometryHeight());
+            D3D12_RECT scissor = Scissor(size.GeometryWidth(), size.GeometryHeight());
             commandList->RSSetViewports(1, &viewport);
             commandList->RSSetScissorRects(1, &scissor);
             commandList->ClearRenderTargetView(rtvs[0], depthClear, 0, nullptr);
@@ -1046,17 +1080,22 @@ struct Renderer::Impl
             DrawObjects(frameState, true);
         }
 
-        // UI pass at 640x360: frame marker plus premultiplied-alpha crosshair.
+        // UI pass at the output size: frame marker plus premultiplied-alpha crosshair.
+        // Mode 1 disables UI; the target is still cleared so its dump is a
+        // transparent-black resource, and the shader constant disables drawing.
         {
             D3D12_CPU_DESCRIPTOR_HANDLE rtv = RtvCpu(targets.rtvBase + 1);
             commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-            D3D12_VIEWPORT viewport = Viewport(kColorWidth, kColorHeight);
-            D3D12_RECT scissor = Scissor(kColorWidth, kColorHeight);
+            D3D12_VIEWPORT viewport = Viewport(size.width, size.height);
+            D3D12_RECT scissor = Scissor(size.width, size.height);
             commandList->RSSetViewports(1, &viewport);
             commandList->RSSetScissorRects(1, &scissor);
             commandList->ClearRenderTargetView(rtv, uiClear, 0, nullptr);
-            commandList->SetPipelineState(uiPipeline.Get());
-            commandList->DrawInstanced(3, 1, 0, 0);
+            if (frameState.uiEnabled)
+            {
+                commandList->SetPipelineState(uiPipeline.Get());
+                commandList->DrawInstanced(3, 1, 0, 0);
+            }
         }
 
         // GPU composite: backbuffer = ui + (1 - ui.a) * color.
@@ -1067,8 +1106,8 @@ struct Renderer::Impl
         {
             D3D12_CPU_DESCRIPTOR_HANDLE rtv = RtvCpu(targets.rtvBase + 2);
             commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-            D3D12_VIEWPORT viewport = Viewport(kColorWidth, kColorHeight);
-            D3D12_RECT scissor = Scissor(kColorWidth, kColorHeight);
+            D3D12_VIEWPORT viewport = Viewport(size.width, size.height);
+            D3D12_RECT scissor = Scissor(size.width, size.height);
             commandList->RSSetViewports(1, &viewport);
             commandList->RSSetScissorRects(1, &scissor);
             commandList->ClearRenderTargetView(rtv, colorClear, 0, nullptr);
@@ -1107,9 +1146,9 @@ Renderer::Renderer(Renderer&&) noexcept = default;
 Renderer& Renderer::operator=(Renderer&&) noexcept = default;
 
 bool Renderer::Initialize(ID3D12Device* device, ID3D12CommandQueue* queue,
-    const std::filesystem::path& shaderPath, std::string& error)
+    const std::filesystem::path& shaderPath, std::string& error, RenderSize renderSize)
 {
-    return impl_->Initialize(device, queue, shaderPath, error);
+    return impl_->Initialize(device, queue, shaderPath, error, renderSize);
 }
 
 bool Renderer::Render(const FrameState& state, SceneKind scene, bool midpoint, std::string& error)
@@ -1156,6 +1195,11 @@ ID3D12Resource* Renderer::Motion() const
 const FrameState& Renderer::State() const
 {
     return impl_->state;
+}
+
+const RenderSize& Renderer::Size() const
+{
+    return impl_->size;
 }
 
 bool Renderer::MidpointActive() const

@@ -1,6 +1,7 @@
 // WARP render-only tests for the render-validation DX12 renderer.
 // These do not create an XeSS-FG context and do not run frame generation.
 
+#include "manifest.h"
 #include "renderer.h"
 
 #include <d3d12.h>
@@ -14,6 +15,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -116,9 +119,10 @@ bool CreateWarpDevice(ComPtr<ID3D12Device>& device, ComPtr<ID3D12CommandQueue>& 
     return SUCCEEDED(device->CreateCommandQueue(&queueDescription, IID_PPV_ARGS(&queue)));
 }
 
-bool DecodeUiMarker(const std::vector<uint8_t>& ui, uint32_t expectedFrame, std::string& error)
+bool DecodeUiMarker(const std::vector<uint8_t>& ui, uint32_t width, uint32_t expectedFrame,
+    std::string& error)
 {
-    const size_t stride = static_cast<size_t>(kColorWidth) * 4;
+    const size_t stride = static_cast<size_t>(width) * 4;
     uint32_t code = 0;
     for (uint32_t bit = 0; bit < 32; ++bit)
     {
@@ -202,6 +206,48 @@ MotionStats ComputeMotionStats(const std::vector<uint8_t>& motion)
     return stats;
 }
 
+struct BgraPixel
+{
+    uint8_t b = 0;
+    uint8_t g = 0;
+    uint8_t r = 0;
+    uint8_t a = 0;
+};
+
+BgraPixel UiPixel(const std::vector<uint8_t>& ui, uint32_t width, uint32_t x, uint32_t y)
+{
+    const size_t offset = (static_cast<size_t>(y) * width + x) * 4;
+    return {ui[offset + 0], ui[offset + 1], ui[offset + 2], ui[offset + 3]};
+}
+
+// Mirrors the shader's per-frame crosshair offset, which stays a fixed number
+// of pixels at every output size.
+void CrosshairCenter(uint32_t frame, uint32_t width, uint32_t height, uint32_t& x, uint32_t& y)
+{
+    const int offsetX = (static_cast<int>(frame) % 7 - 3) * 3;
+    const int offsetY = ((static_cast<int>(frame) / 7) % 5 - 2) * 2;
+    x = static_cast<uint32_t>(static_cast<int>(width / 2) + offsetX);
+    y = static_cast<uint32_t>(static_cast<int>(height / 2) + offsetY);
+}
+
+void TestRenderSizeTypes()
+{
+    const RenderSize defaultSize;
+    Check(defaultSize.width == 640 && defaultSize.height == 360,
+        "default RenderSize is 640x360");
+    Check(defaultSize.GeometryWidth() == 320 && defaultSize.GeometryHeight() == 180,
+        "default geometry is half size");
+
+    const RenderSize hd{1280, 720};
+    const RenderSize fhd{1920, 1080};
+    const RenderSize qhd{2560, 1440};
+    const RenderSize uhd{3840, 2160};
+    Check(hd.GeometryWidth() == 640 && hd.GeometryHeight() == 360, "720p geometry is half size");
+    Check(fhd.GeometryWidth() == 960 && fhd.GeometryHeight() == 540, "1080p geometry is half size");
+    Check(qhd.GeometryWidth() == 1280 && qhd.GeometryHeight() == 720, "1440p geometry is half size");
+    Check(uhd.GeometryWidth() == 1920 && uhd.GeometryHeight() == 1080, "4K geometry is half size");
+}
+
 void TestMatrixConventions()
 {
     const auto transform = [](const float point[4], const Matrix4& matrix) {
@@ -239,6 +285,206 @@ void TestMatrixConventions()
     Check(clip[3] > 0.0f, "front point has positive clip w");
     Check(clip[2] / clip[3] > 0.0f && clip[2] / clip[3] < 1.0f,
         "front point depth is in normal-Z range");
+}
+
+bool TestMode1NoUi(Renderer& renderer)
+{
+    std::string error;
+    FrameState state = MakeFrameState(SceneKind::Translation, 5, false);
+    state.uiEnabled = false;
+    std::vector<uint8_t> color;
+    std::vector<uint8_t> ui;
+    std::vector<uint8_t> backbuffer;
+    if (!renderer.Render(state, SceneKind::Translation, false, error) ||
+        !Readback(renderer.Color(), color, error) ||
+        !Readback(renderer.Ui(), ui, error) ||
+        !Readback(renderer.Backbuffer(), backbuffer, error))
+    {
+        std::printf("FAIL: mode1 render/readback: %s\n", error.c_str());
+        return false;
+    }
+    Check(std::all_of(ui.begin(), ui.end(), [](uint8_t value) { return value == 0; }),
+        "mode1 UI target is transparent black");
+    Check(backbuffer == color, "mode1 backbuffer equals hudless color byte-for-byte");
+    const std::vector<uint8_t> mode1Color = color;
+
+    state.uiEnabled = true;
+    std::vector<uint8_t> uiColor;
+    std::vector<uint8_t> uiUi;
+    std::vector<uint8_t> uiBackbuffer;
+    if (!renderer.Render(state, SceneKind::Translation, false, error) ||
+        !Readback(renderer.Color(), uiColor, error) ||
+        !Readback(renderer.Ui(), uiUi, error) ||
+        !Readback(renderer.Backbuffer(), uiBackbuffer, error))
+    {
+        std::printf("FAIL: UI-enabled render/readback: %s\n", error.c_str());
+        return false;
+    }
+    Check(uiColor == mode1Color, "enabling UI does not change hudless color");
+    Check(std::any_of(uiUi.begin(), uiUi.end(), [](uint8_t value) { return value != 0; }),
+        "UI-enabled UI target is not empty");
+    Check(uiBackbuffer != uiColor, "UI-enabled backbuffer differs from hudless color");
+    return true;
+}
+
+void TestPairStates()
+{
+    Check(!IsValidPairFrame(SceneKind::Cut, kCutFrame),
+        "cut pair ending at frame 7 crosses the cut and is rejected");
+    Check(IsValidPairFrame(SceneKind::Cut, kCutFrame + 1),
+        "cut pair ending at frame 8 is valid");
+    Check(IsValidPairFrame(SceneKind::Translation, 1), "pair frame 1 is valid");
+    Check(!IsValidPairFrame(SceneKind::Translation, 0), "pair frame 0 is invalid");
+
+    const FrameState first = MakeIsolatedPairFrameState(SceneKind::Cut, kCutFrame, true, false);
+    const FrameState second = MakeIsolatedPairFrameState(SceneKind::Cut, kCutFrame + 1, false, false);
+    Check(first.sourceFrame == kCutFrame && first.time == float(kCutFrame),
+        "first pair state keeps its source frame and time");
+    Check(first.historyReset && first.previousTime == first.time,
+        "first pair submission resets history");
+    Check(second.sourceFrame == kCutFrame + 1 && second.time == float(kCutFrame + 1),
+        "second pair state keeps its source frame and time");
+    Check(!second.historyReset && second.previousTime == float(kCutFrame),
+        "second pair submission follows previous source time");
+
+    const FrameState translationFirst = MakeIsolatedPairFrameState(SceneKind::Translation, 4, true, false);
+    const FrameState translationSecond = MakeIsolatedPairFrameState(SceneKind::Translation, 5, false, false);
+    Check(translationFirst.historyReset && translationFirst.previousTime == 4.0f,
+        "non-cut first pair submission is still reset");
+    Check(translationSecond.previousTime == 4.0f && translationSecond.time == 5.0f,
+        "non-cut second pair submission spans the requested source pair");
+}
+
+void TestSceneManifestSchema()
+{
+    SceneManifest manifest;
+    manifest.name = "translation";
+    manifest.mode = 1;
+    manifest.pairingMethod = "isolated_pair";
+    manifest.hasSourcePair = true;
+    manifest.sourcePair = {4, 5};
+    manifest.warmup = 0;
+    manifest.measuredFrames = 2;
+    SceneFrameRecord first;
+    first.index = 0;
+    first.sceneFrame = 4;
+    first.resetHistory = true;
+    first.time = 4.0f;
+    first.previousTime = 4.0f;
+    first.submissionResults[0] = 0;
+    SceneFrameRecord second;
+    second.index = 1;
+    second.sceneFrame = 5;
+    second.hasPrevious = true;
+    second.previousFrame = 0;
+    second.time = 5.0f;
+    second.previousTime = 4.0f;
+    second.submissionResults[0] = 0;
+    second.submissionResults[1] = 0;
+    manifest.frames = {first, second};
+
+    const std::filesystem::path path = std::filesystem::temp_directory_path()
+        / "xefg_render_validation_scene_test.json";
+    std::string error;
+    if (!WriteSceneManifest(path, manifest, error))
+    {
+        std::printf("FAIL: scene manifest write: %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    std::ifstream file(path, std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    file.close();
+    std::filesystem::remove(path);
+
+    Check(text.find("\"mode\": 1") != std::string::npos, "scene manifest records mode");
+    Check(text.find("\"pairing_method\": \"isolated_pair\"") != std::string::npos,
+        "scene manifest records isolated pairing method");
+    Check(text.find("\"source_pair\": [4, 5]") != std::string::npos,
+        "scene manifest records the source pair");
+    Check(text.find("\"index\": 0, \"scene_frame\": 4") != std::string::npos,
+        "scene manifest keeps local index and real source frame");
+    Check(text.find("\"index\": 1, \"scene_frame\": 5") != std::string::npos,
+        "second scene submission keeps contiguous local index");
+    Check(text.find("\"ui\": null") != std::string::npos,
+        "mode 1 scene manifest emits null UI submission result");
+    Check(text.find("\"color\": null") != std::string::npos,
+        "mode 1 scene manifest emits null color submission result");
+    Check(text.find("\"present_id\": null") != std::string::npos,
+        "uncalled submission results are null");
+    Check(text.find("\"marker\"") == std::string::npos,
+        "mode 1 scene manifest omits the absent UI marker");
+    Check(text.find("\"excluded_rects\"") == std::string::npos,
+        "mode 1 scene manifest omits the absent UI exclusion strip");
+
+    manifest.hasSourcePair = false;
+    manifest.pairingMethod = "sequential";
+    if (WriteSceneManifest(path, manifest, error))
+    {
+        std::ifstream sequentialFile(path, std::ios::binary);
+        const std::string sequentialText((std::istreambuf_iterator<char>(sequentialFile)),
+            std::istreambuf_iterator<char>());
+        sequentialFile.close();
+        std::filesystem::remove(path);
+        Check(sequentialText.find("\"pairing_method\": \"sequential\"") != std::string::npos,
+            "sequential scene manifest records its method");
+        Check(sequentialText.find("\"source_pair\"") == std::string::npos,
+            "sequential scene manifest omits source_pair");
+    }
+    else
+    {
+        Check(false, "sequential scene manifest write: " + error);
+    }
+
+    const auto readManifestText = [&]() {
+        std::ifstream file(path, std::ios::binary);
+        std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        file.close();
+        std::filesystem::remove(path);
+        return text;
+    };
+
+    // The calibrated 640x360 layout keeps both the fixed marker description and
+    // the exclusion rectangles that Python still owns authoritatively.
+    manifest.mode = 3;
+    manifest.width = 640;
+    manifest.height = 360;
+    manifest.motionWidth = 320;
+    manifest.motionHeight = 180;
+    if (WriteSceneManifest(path, manifest, error))
+    {
+        const std::string calibrated = readManifestText();
+        Check(calibrated.find("\"marker\"") != std::string::npos,
+            "640 UI manifest records the fixed marker");
+        Check(calibrated.find("\"excluded_rects\"") != std::string::npos,
+            "640 UI manifest retains the calibrated exclusions");
+    }
+    else
+    {
+        Check(false, "640 UI scene manifest write: " + error);
+    }
+
+    // New sizes keep the same fixed marker but must not invent scaled native
+    // exclusion rectangles before the official layout is calibrated.
+    manifest.width = 1920;
+    manifest.height = 1080;
+    manifest.motionWidth = 960;
+    manifest.motionHeight = 540;
+    if (WriteSceneManifest(path, manifest, error))
+    {
+        const std::string uncalibrated = readManifestText();
+        Check(uncalibrated.find("\"marker\"") != std::string::npos,
+            "new-size UI manifest keeps the fixed marker");
+        Check(uncalibrated.find("\"excluded_rects\"") == std::string::npos,
+            "new-size UI manifest omits uncalibrated excluded_rects");
+        Check(uncalibrated.find("\"width\": 1920") != std::string::npos
+            && uncalibrated.find("\"height\": 1080") != std::string::npos,
+            "new-size UI manifest records output dimensions");
+    }
+    else
+    {
+        Check(false, "new-size UI scene manifest write: " + error);
+    }
 }
 
 bool TestScene(Renderer& renderer, SceneKind scene){
@@ -375,7 +621,7 @@ bool TestScene(Renderer& renderer, SceneKind scene){
     Check(midpointUi.size() == size_t(kColorWidth) * kColorHeight * 4,
         sceneName + " midpoint UI size");
     std::string markerError;
-    Check(DecodeUiMarker(midpointUi, midpointFrame, markerError),
+    Check(DecodeUiMarker(midpointUi, kColorWidth, midpointFrame, markerError),
         sceneName + " midpoint UI marker: " + markerError);
 
     double midpointDifference = 0.0;
@@ -399,6 +645,84 @@ bool TestScene(Renderer& renderer, SceneKind scene){
 
     return true;
 }
+
+bool TestRenderSizeDimensions(Renderer& renderer640, ID3D12Device* device,
+    ID3D12CommandQueue* queue, const std::filesystem::path& shader)
+{
+    std::string error;
+    const RenderSize reference = renderer640.Size();
+    Check(reference.width == 640 && reference.height == 360, "renderer reports default 640x360");
+    Check(reference.GeometryWidth() == 320 && reference.GeometryHeight() == 180,
+        "640 renderer geometry targets are half size");
+
+    const RenderSize wideSize{1920, 1080};
+    const uint32_t frame = 5;
+    const FrameState state = MakeFrameState(SceneKind::Translation, frame, false);
+
+    // 640 reference: fixed marker and fixed-size crosshair.
+    std::vector<uint8_t> ui640;
+    if (!renderer640.Render(state, SceneKind::Translation, false, error) ||
+        !Readback(renderer640.Ui(), ui640, error))
+    {
+        std::printf("FAIL: 640 dimension render/readback: %s\n", error.c_str());
+        return false;
+    }
+    Check(ui640.size() == size_t(640) * 360 * 4, "640 UI byte size");
+    std::string markerError;
+    Check(DecodeUiMarker(ui640, 640, frame, markerError), "640 UI marker: " + markerError);
+    uint32_t centerX = 0;
+    uint32_t centerY = 0;
+    CrosshairCenter(frame, 640, 360, centerX, centerY);
+    Check(UiPixel(ui640, 640, centerX, centerY).a != 0, "640 crosshair centred at output/2");
+    Check(UiPixel(ui640, 640, centerX + 25, centerY).a == 0,
+        "640 crosshair retains a fixed 24 px extent");
+
+    Renderer wide;
+    if (!wide.Initialize(device, queue, shader, error, wideSize))
+    {
+        std::printf("FAIL: 1080 renderer initialize: %s\n", error.c_str());
+        return false;
+    }
+    Check(wide.Size().width == 1920 && wide.Size().height == 1080,
+        "renderer reports 1920x1080");
+
+    std::vector<uint8_t> color;
+    std::vector<uint8_t> ui;
+    std::vector<uint8_t> backbuffer;
+    std::vector<uint8_t> depth;
+    std::vector<uint8_t> motion;
+    if (!wide.Render(state, SceneKind::Translation, false, error) ||
+        !Readback(wide.Color(), color, error) ||
+        !Readback(wide.Ui(), ui, error) ||
+        !Readback(wide.Backbuffer(), backbuffer, error) ||
+        !Readback(wide.Depth(), depth, error) ||
+        !Readback(wide.Motion(), motion, error))
+    {
+        std::printf("FAIL: 1080 render/readback: %s\n", error.c_str());
+        return false;
+    }
+    Check(color.size() == size_t(1920) * 1080 * 4, "1080 color byte size");
+    Check(ui.size() == size_t(1920) * 1080 * 4, "1080 UI byte size");
+    Check(backbuffer.size() == size_t(1920) * 1080 * 4, "1080 backbuffer byte size");
+    Check(depth.size() == size_t(960) * 540 * 4, "1080 depth uses half geometry");
+    Check(motion.size() == size_t(960) * 540 * 4, "1080 motion uses half geometry");
+
+    const DepthStats depthStats = ComputeDepthStats(depth);
+    Check(depthStats.finite && depthStats.inRange, "1080 depth finite and in range");
+    Check(depthStats.maximum > depthStats.minimum, "1080 depth has visible geometry");
+    const MotionStats motionStats = ComputeMotionStats(motion);
+    Check(motionStats.finite, "1080 motion finite");
+    Check(motionStats.nonZeroPixels > 0.0, "1080 motion has nonzero pixels");
+
+    markerError.clear();
+    Check(DecodeUiMarker(ui, 1920, frame, markerError),
+        "1080 UI marker stays at 96,32: " + markerError);
+    CrosshairCenter(frame, 1920, 1080, centerX, centerY);
+    Check(UiPixel(ui, 1920, centerX, centerY).a != 0, "1080 crosshair centred at output/2");
+    Check(UiPixel(ui, 1920, centerX + 25, centerY).a == 0,
+        "1080 crosshair retains a fixed 24 px extent");
+    return true;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -411,6 +735,9 @@ int main(int argc, char** argv)
     }
     std::printf("shader: %s\n", shader.string().c_str());
     TestMatrixConventions();
+    TestPairStates();
+    TestSceneManifestSchema();
+    TestRenderSizeTypes();
 
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
@@ -432,9 +759,12 @@ int main(int argc, char** argv)
         std::printf("FAIL: renderer not ready\n");
         return 1;
     }
+    if (!TestMode1NoUi(renderer)) return 1;
 
     for (size_t i = 0; i < kSceneCount; ++i)
         TestScene(renderer, static_cast<SceneKind>(i));
+
+    if (!TestRenderSizeDimensions(renderer, device.Get(), queue.Get(), shader)) return 1;
 
     ComPtr<ID3D12InfoQueue> info;
     if (SUCCEEDED(device.As(&info)))

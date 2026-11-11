@@ -42,19 +42,21 @@ def analyze(scene_dir):
     run = scene_dir / "capture"
     inputs = json.loads((run / "application_inputs/manifest.json").read_text())
     pairing = json.loads((scene_dir / "pairing/pairing.json").read_text())
-    mask = load_tool("rendered_pairing").mask_rects((360, 640), pairing["excluded_rects"])
+    width, height = inputs["width"], inputs["height"]
+    mw, mh = inputs["motion_width"], inputs["motion_height"]
+    mask = load_tool("rendered_pairing").mask_rects((height, width), pairing["excluded_rects"])
     rows = []
     for pair in pairing["pairs"]:
         if pair["classification"] != "generated":
             continue
         frame = pair["current_frame"]
         roles = inputs["frames"][frame]["inputs"]
-        official = np.fromfile(run / pair["file"], np.uint8).reshape(360, 640, 4)
+        official = np.fromfile(run / pair["file"], np.uint8).reshape(height, width, 4)
         sdk = np.load(scene_dir / "replay" / f"frame_{frame:05d}.npy", allow_pickle=False)
         diff = np.abs(official[:, :, :3].astype(np.int16) - sdk[:, :, :3]).max(axis=2)
-        motion = np.fromfile(run / "application_inputs" / roles["motion"], "<f2").reshape(180, 320, 2).astype(np.float32)
-        depth = np.fromfile(run / "application_inputs" / roles["depth"], "<f4").reshape(180, 320)
-        ui = np.fromfile(run / "application_inputs" / roles["ui"], np.uint8).reshape(360, 640, 4)
+        motion = np.fromfile(run / "application_inputs" / roles["motion"], "<f2").reshape(mh, mw, 2).astype(np.float32)
+        depth = np.fromfile(run / "application_inputs" / roles["depth"], "<f4").reshape(mh, mw)
+        ui = np.fromfile(run / "application_inputs" / roles["ui"], np.uint8).reshape(height, width, 4)
         mv_edge = boundaries(motion, 0.25).repeat(2, 0).repeat(2, 1)
         depth_edge = boundaries(depth, 0.001).repeat(2, 0).repeat(2, 1)
         significant = (diff > 2) & mask
@@ -84,7 +86,9 @@ if __name__ == "__main__":
     parser.add_argument("--matrix", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    reports = {scene: analyze(args.matrix / scene) for scene in ("translation", "occlusion", "camera", "cut")}
+    directories = sorted(path.parent for path in args.matrix.rglob("capture")
+                         if (path.parent / "replay/report.json").exists())
+    reports = {str(directory.relative_to(args.matrix)): analyze(directory) for directory in directories}
     with args.out.open("x", encoding="utf-8") as stream:
         json.dump(reports, stream, indent=2, allow_nan=False)
         stream.write("\n")

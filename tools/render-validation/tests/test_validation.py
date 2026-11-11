@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 spec = importlib.util.spec_from_file_location("validation", Path(__file__).parents[1] / "validate.py")
@@ -139,6 +141,24 @@ class InventoryTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             validation.write_report(self.root, output)
         self.assertEqual((output / "report.json").read_bytes(), original)
+
+
+class RenderCommandTests(unittest.TestCase):
+    def test_mode_and_isolated_source_frame_forwarded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            renderer = root / "renderer.exe"
+            renderer.write_bytes(b"fixture")
+            args = SimpleNamespace(out=root / "out", renderer=renderer, scene="camera", frames=8,
+                                   pacing_ms=16, xess_bin=root, mode=1, pair_frame=5, size="1920x1080",
+                                   render_only=False, warp=False, debug=False, no_tag=False)
+            with patch.object(validation.subprocess, "run") as run, patch.object(validation, "write_report",
+                    return_value={"status": "needs_attention", "present_count": 1, "issues": ["reset"]}):
+                self.assertEqual(validation.render_capture(args), 1)
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("--mode") + 1], "1")
+            self.assertEqual(command[command.index("--pair-frame") + 1], "5")
+            self.assertEqual(command[command.index("--size") + 1], "1920x1080")
 
 
 if __name__ == "__main__":

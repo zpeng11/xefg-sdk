@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import tempfile
+import json
 
 import numpy as np
 import onnx
@@ -18,6 +20,29 @@ sampling = load("probe_sampling")
 
 
 class EdgeDiagnosticTests(unittest.TestCase):
+    def test_analysis_uses_manifest_dimensions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("capture/application_inputs", "pairing", "replay"):
+                (root / name).mkdir(parents=True)
+            pixels = np.zeros((8, 16, 4), np.uint8)
+            pixels.tofile(root / "capture/official.bgra")
+            changed = pixels.copy()
+            changed[4, 8, 0] = 5
+            np.save(root / "replay/frame_00000.npy", changed)
+            roles = {"ui": "ui.raw", "motion": "motion.raw", "depth": "depth.raw"}
+            for role, values in (("ui", pixels), ("motion", np.zeros((4, 8, 2), "<f2")),
+                                 ("depth", np.ones((4, 8), "<f4"))):
+                values.tofile(root / "capture/application_inputs" / roles[role])
+            manifest = {"width": 16, "height": 8, "motion_width": 8, "motion_height": 4,
+                        "frames": [{"inputs": roles}]}
+            (root / "capture/application_inputs/manifest.json").write_text(json.dumps(manifest))
+            (root / "pairing/pairing.json").write_text(json.dumps({"excluded_rects": [], "pairs": [
+                {"classification": "generated", "current_frame": 0, "file": "official.bgra"}]}))
+            result = edges.analyze(root)["frames"][0]
+            self.assertEqual(result["over_2_pixels"], 1)
+            self.assertEqual(result["over_2_bbox_xyxy"], [8, 4, 9, 5])
+
     def test_boundaries_mark_both_sides(self):
         values = np.zeros((4, 4), dtype=np.float32)
         values[:, 2:] = 1

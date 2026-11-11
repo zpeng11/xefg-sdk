@@ -14,8 +14,8 @@ cbuffer FrameConstants : register(b1)
 {
     row_major float4x4 ViewProj;
     row_major float4x4 PreviousViewProj;
-    float4 Viewport;  // xy = color size (640x360), zw = motion size (320x180)
-    float4 FrameData; // x = application frame id, y = midpoint, z = history reset
+    float4 Viewport;  // xy = output size, zw = half-size geometry targets
+    float4 FrameData; // x = UI/application frame id, y = midpoint, z = history reset, w = UI enabled
 };
 
 struct SceneVertex
@@ -115,12 +115,18 @@ FullscreenVSOut FullscreenVS(uint vertexId : SV_VertexID)
 
 float4 UiPS(FullscreenVSOut input) : SV_Target
 {
+    // Mode 1 has no UI at all; the clear already wrote transparent black.
+    if (FrameData.w < 0.5)
+        return float4(0.0, 0.0, 0.0, 0.0);
+
     uint2 pixel = uint2(input.position.xy);
     // Per-frame UI motion; the calibration marker below stays fixed.
     float2 offset = float2(
         (float)((int)FrameData.x % 7 - 3) * 3.0,
         (float)(((int)FrameData.x / 7) % 5 - 2) * 2.0);
-    float2 centered = abs(float2(pixel) + 0.5 - (float2(320.0, 180.0) + offset));
+    // Crosshair stays centred on the output with the same pixel extent at
+    // every resolution; the per-frame motion is also a fixed pixel offset.
+    float2 centered = abs(float2(pixel) + 0.5 - (Viewport.xy * 0.5 + offset));
 
     // Premultiplied-alpha crosshair.
     float4 ui = float4(0.0, 0.0, 0.0, 0.0);

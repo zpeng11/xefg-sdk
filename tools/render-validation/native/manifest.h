@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -174,7 +175,10 @@ struct SceneObjectRecord
 
 struct SceneFrameRecord
 {
+    // Local submission index (always contiguous from zero).  sceneFrame is the
+    // rendering source frame, which differs from index in isolated-pair mode.
     uint32_t index = 0;
+    uint32_t sceneFrame = 0;
     bool hasPrevious = false;
     uint32_t previousFrame = 0;
     bool resetHistory = false;
@@ -182,8 +186,10 @@ struct SceneFrameRecord
     float time = 0.0f;
     float previousTime = 0.0f;
 
-    // depth, motion, color, ui, constants, present_id
-    std::array<int32_t, 6> submissionResults{};
+    // depth, motion, color, ui, constants, present_id.  Empty means the public
+    // submission was not performed (for example UI in modes 1 and 4, or every
+    // submission in render-only runs) and is written as null.
+    std::array<std::optional<int32_t>, 6> submissionResults{};
 
     std::array<float, 16> view{};
     std::array<float, 16> projection{};
@@ -194,6 +200,10 @@ struct SceneManifest
 {
     std::string name;
     uint32_t revision = 1;
+    uint32_t mode = 3;
+    std::string pairingMethod = "sequential";
+    bool hasSourcePair = false;
+    std::array<uint32_t, 2> sourcePair{};
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t motionWidth = 0;
@@ -230,16 +240,34 @@ inline bool WriteSceneManifest(const std::filesystem::path& path, const SceneMan
     file << "  \"schema\": \"xefg.render_scene/1\",\n";
     file << "  \"name\": \"" << JsonEscape(manifest.name) << "\",\n";
     file << "  \"revision\": " << manifest.revision << ",\n";
+    file << "  \"mode\": " << manifest.mode << ",\n";
+    file << "  \"pairing_method\": \"" << JsonEscape(manifest.pairingMethod) << "\",\n";
+    if (manifest.hasSourcePair)
+    {
+        file << "  \"source_pair\": [" << manifest.sourcePair[0] << ", "
+             << manifest.sourcePair[1] << "],\n";
+    }
     file << "  \"width\": " << manifest.width << ",\n";
     file << "  \"height\": " << manifest.height << ",\n";
     file << "  \"motion_width\": " << manifest.motionWidth << ",\n";
     file << "  \"motion_height\": " << manifest.motionHeight << ",\n";
     file << "  \"warmup\": " << manifest.warmup << ",\n";
     file << "  \"measured_frames\": " << manifest.measuredFrames << ",\n";
-    file << "  \"marker\": {\"x\": 96, \"y\": 32, \"cell_width\": 8, \"cell_height\": 8, "
-            "\"bits\": 32, \"encoding\": \"u16-complement-lsb\", \"threshold\": 128},\n";
-    file << "  \"excluded_rects\": [[0, 0, 64, 64], [576, 0, 640, 64], [0, 296, 64, 360], "
-            "[576, 296, 640, 360], [48, 0, 64, 360], [576, 0, 592, 360], [96, 32, 352, 40]],\n";
+    // Mode 1 has no UI at all, so there is no calibration marker or UI overlay
+    // strip to describe or exclude.  The fixed marker layout is retained, but
+    // excluded_rects only exists for the calibrated 640x360 size: until new
+    // sizes are actually calibrated, omit the guess (Python owns the
+    // authoritative mask).
+    if (manifest.mode != 1)
+    {
+        file << "  \"marker\": {\"x\": 96, \"y\": 32, \"cell_width\": 8, \"cell_height\": 8, "
+                "\"bits\": 32, \"encoding\": \"u16-complement-lsb\", \"threshold\": 128},\n";
+        if (manifest.width == 640 && manifest.height == 360)
+        {
+            file << "  \"excluded_rects\": [[0, 0, 64, 64], [576, 0, 640, 64], [0, 296, 64, 360], "
+                    "[576, 296, 640, 360], [48, 0, 64, 360], [576, 0, 592, 360], [96, 32, 352, 40]],\n";
+        }
+    }
     file << "  \"depth_encoding\": \"device-normal-z\",\n";
     file << "  \"color_space\": \"linear-unorm\",\n";
     file << "  \"color_space_note\": \"no sRGB\",\n";
@@ -251,19 +279,27 @@ inline bool WriteSceneManifest(const std::filesystem::path& path, const SceneMan
     for (size_t i = 0; i < manifest.frames.size(); ++i)
     {
         const auto& frame = manifest.frames[i];
-        file << "    {\"index\": " << frame.index << ", \"previous_frame\": ";
+        file << "    {\"index\": " << frame.index
+             << ", \"scene_frame\": " << frame.sceneFrame << ", \"previous_frame\": ";
         if (frame.hasPrevious) file << frame.previousFrame;
         else file << "null";
         file << ", \"reset_history\": " << (frame.resetHistory ? "true" : "false");
         file << ", \"midpoint\": \"" << JsonEscape(frame.midpoint) << "\"";
         file << ", \"time\": " << JsonFloat(frame.time)
              << ", \"previous_time\": " << JsonFloat(frame.previousTime);
-        file << ", \"submission_results\": {\"depth\": " << frame.submissionResults[0]
-             << ", \"motion\": " << frame.submissionResults[1]
-             << ", \"color\": " << frame.submissionResults[2]
-             << ", \"ui\": " << frame.submissionResults[3]
-             << ", \"constants\": " << frame.submissionResults[4]
-             << ", \"present_id\": " << frame.submissionResults[5] << "}";
+        file << ", \"submission_results\": {";
+        static constexpr const char* names[6] = {
+            "depth", "motion", "color", "ui", "constants", "present_id"};
+        for (size_t resultIndex = 0; resultIndex < frame.submissionResults.size(); ++resultIndex)
+        {
+            if (resultIndex) file << ", ";
+            file << '"' << names[resultIndex] << "\": ";
+            if (frame.submissionResults[resultIndex])
+                file << *frame.submissionResults[resultIndex];
+            else
+                file << "null";
+        }
+        file << "}";
         file << ", \"view\": ";
         WriteFloatArray(file, frame.view);
         file << ", \"projection\": ";

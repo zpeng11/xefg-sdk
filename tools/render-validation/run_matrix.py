@@ -1,6 +1,7 @@
-"""Run the four fixed raster scenes serially and retain per-stage results."""
+"""Run fixed raster scenes and explicit modes serially, including numeric gates."""
 import argparse
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -9,53 +10,160 @@ import sys
 SCENES = ("translation", "occlusion", "camera", "cut")
 
 
+SIZES = ("640x360", "1280x720", "1920x1080", "2560x1440", "3840x2160")
+
+
+def preflight_package(directory, sizes, modes):
+    from xefg_sdk.package import ModelPackage
+    from xefg_sdk.planner import Planner
+    package = ModelPackage(directory)
+    planner = Planner(package)
+    rows = []
+    for size in sizes:
+        width, height = map(int, size.split("x"))
+        for mode in modes:
+            plan = planner.resolve(mode, (width, height), (width // 2, height // 2))
+            variant = package.variants[plan.variant_id]
+            profile_path = next(name for name in variant["profiles"]
+                                if package.read_json(name)["id"] == plan.profile_id)
+            rows.append({"size": size, "mode": mode, "profile": plan.profile_id,
+                         "variant": plan.variant_id, "model_sha256": variant["model_sha256"],
+                         "profile_file": profile_path,
+                         "profile_sha256": hashlib.sha256(package.path(profile_path).read_bytes()).hexdigest()})
+    return rows
+
+
+def run_case(args, directory, scene, mode, pair_frame=None, size="640x360"):
+    tools = Path(__file__).resolve().parent
+    render = ["render", "--renderer", str(args.renderer.resolve()),
+              "--xess-bin", str(args.xess_bin.resolve()), "--scene", scene,
+              "--mode", str(mode), "--size", size, "--out", str(directory)]
+    if pair_frame is not None:
+        render += ["--pair-frame", str(pair_frame)]
+    commands = [
+        ("render", "validate.py", render),
+        ("inputs", "check_render_inputs.py", ["--run", str(directory / "capture"),
+         "--out", str(directory / "input-check.json")]),
+        ("pair", "validate.py", ["pair", "--run", str(directory / "capture"),
+         "--out", str(directory / "pairing")]),
+        ("replay", "validate.py", ["replay", "--run", str(directory / "capture"),
+         "--pairing", str(directory / "pairing/pairing.json"), "--package", str(args.package.resolve()),
+         "--out", str(directory / "replay"), "--all"]),
+        ("quality", "check_quality.py", ["--report", str(directory / "replay/report.json"),
+         "--out", str(directory / "quality.json")]),
+    ]
+    width, height = map(int, size.split("x"))
+    result = {"directory": str(directory), "size": size, "output_size": [width, height],
+              "motion_size": [width // 2, height // 2],
+              "source_pair": [pair_frame - 1, pair_frame] if pair_frame else None,
+              "stages": [], "status": "run_failed", "completed": False}
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    for stage, script, arguments in commands:
+        command = [sys.executable, "-I", "-B", str(tools / script), *arguments]
+        log_path = directory.parent / f"{directory.name}-{stage}.log"
+        with log_path.open("x", encoding="utf-8") as log:
+            process = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
+        result["stages"].append({"stage": stage, "exit_code": process.returncode,
+                                 "command": command, "log": str(log_path)})
+        print(f"{size}/mode{mode}/{scene}/{pair_frame or 'sequence'}: {stage} exit {process.returncode}", flush=True)
+        if process.returncode:
+            # Only a successfully written inventory can explain reset warnings.
+            if stage == "render" and process.returncode == 1 and (directory / "inventory/report.json").exists():
+                continue
+            if stage == "quality" and process.returncode == 1 and (directory / "quality.json").exists():
+                gate = json.loads((directory / "quality.json").read_text(encoding="utf-8"))
+                if gate.get("schema") == "xefg.quality_gate/1" and any(
+                        check["status"] == "fail" for check in gate.get("checks", [])):
+                    result["status"] = "quality_failed"
+            break
+        if stage == "quality":
+            gate_path = directory / "quality.json"
+            if gate_path.exists():
+                gate = json.loads(gate_path.read_text(encoding="utf-8"))
+                if gate.get("schema") == "xefg.quality_gate/1" and gate.get("checks") and all(
+                        check["status"] == "pass" for check in gate["checks"]):
+                    result["status"] = "pass"
+    result["completed"] = result["status"] in ("pass", "quality_failed")
+    if result["completed"]:
+        report = json.loads((directory / "replay/report.json").read_text(encoding="utf-8"))
+        result["profiles"] = sorted({row["profile"] for row in report["pairs"] if "profile" in row})
+        result["valid_pixel_counts"] = sorted({row["valid_region"]["pixels"] for row in report["pairs"]
+                                               if "pixels" in row["valid_region"]})
+        result["generated_frames"] = len(report["pairs"])
+        result["max_frame_rgb_mae"] = max(row["valid_region"]["rgb_mae"] for row in report["pairs"])
+        result["max_channel_error"] = max(row["valid_region"]["rgb_max"] for row in report["pairs"])
+        result["max_over_2_fraction"] = max(row["valid_region"]["over_tolerance_pixel_fraction"] for row in report["pairs"])
+    return result
+
+
+def combined_status(rows):
+    if any(row["status"] == "run_failed" for row in rows):
+        return "run_failed"
+    return "quality_failed" if any(row["status"] == "quality_failed" for row in rows) else "pass"
+
+
+def write_summary(output, report):
+    (output / "matrix.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    lines = ["# Render validation matrix", "", f"Status: {report['status']}", "",
+             "| Size | Mode | Scene | Status | Measured frames | Worst MAE | Max channel | Worst >2 fraction |",
+             "|---|---|---|---|---:|---:|---:|---:|"]
+    for row in report["scenes"]:
+        lines.append(f"| {row['size']} | {row['mode']} | {row['scene']} | {row['status']} | {row['generated_frames']} | "
+                     f"{row['max_frame_rgb_mae']} | {row['max_channel_error']} | {row['max_over_2_fraction']} |")
+    lines += ["", "Byte-unit RGB metrics exclude only recorded official tags and any frame marker.",
+              "Cut source frame 7 is skipped because history resets. See JSON for stage logs and source pairs."]
+    (output / "matrix.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--renderer", type=Path, required=True)
     parser.add_argument("--xess-bin", type=Path, required=True)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--modes", type=int, nargs="+", choices=(1, 3, 4), default=[3])
+    parser.add_argument("--sizes", nargs="+", choices=SIZES, default=["640x360"])
     args = parser.parse_args()
+    if len(set(args.modes)) != len(args.modes) or len(set(args.sizes)) != len(args.sizes):
+        parser.error("--modes and --sizes must not contain duplicates")
     output = args.out.resolve()
+    if output.exists():
+        raise FileExistsError(output)
+    profiles = preflight_package(args.package, args.sizes, args.modes)
     output.mkdir(parents=True, exist_ok=False)
-    tools = Path(__file__).resolve().parent
     results = []
-    for scene in SCENES:
-        directory = output / scene
-        commands = [
-            ("render", "validate.py", ["render", "--renderer", str(args.renderer.resolve()),
-             "--xess-bin", str(args.xess_bin.resolve()), "--scene", scene, "--out", str(directory)]),
-            ("inputs", "check_render_inputs.py", ["--run", str(directory / "capture"),
-             "--out", str(directory / "input-check.json")]),
-            ("pair", "validate.py", ["pair", "--run", str(directory / "capture"),
-             "--out", str(directory / "pairing")]),
-            ("replay", "validate.py", ["replay", "--run", str(directory / "capture"),
-             "--pairing", str(directory / "pairing/pairing.json"), "--package", str(args.package.resolve()),
-             "--out", str(directory / "replay"), "--all"]),
-        ]
-        result = {"scene": scene, "stages": []}
-        for stage, script, arguments in commands:
-            command = [sys.executable, "-I", "-B", str(tools / script), *arguments]
-            with (output / f"{scene}-{stage}.log").open("w", encoding="utf-8") as log:
-                process = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
-            result["stages"].append({"stage": stage, "exit_code": process.returncode, "command": command})
-            print(f"{scene}: {stage} exit {process.returncode}", flush=True)
-            if process.returncode:
-                # History-reset experiments can report inventory warnings even
-                # though the native process and captured resources are complete.
-                if stage == "render" and (directory / "inventory/report.json").exists():
-                    continue
-                break
-        result["completed"] = result["stages"][-1]["stage"] == "replay" and result["stages"][-1]["exit_code"] == 0
-        if result["completed"]:
-            report = json.loads((directory / "replay/report.json").read_text(encoding="utf-8"))
-            result["generated_frames"] = len(report["pairs"])
-            result["max_frame_rgb_mae"] = max(row["valid_region"]["rgb_mae"] for row in report["pairs"])
-            result["max_channel_error"] = max(row["valid_region"]["rgb_max"] for row in report["pairs"])
-        results.append(result)
-        (output / "matrix.json").write_text(json.dumps({"schema": "xefg.render_matrix/1", "scenes": results},
-                                                       indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    return 0 if all(row["completed"] for row in results) else 1
+    for size in args.sizes:
+        root = output if args.sizes == ["640x360"] else output / size
+        for mode in args.modes:
+            for scene in SCENES:
+                directory = root / scene if args.sizes == ["640x360"] and args.modes == [3] else root / f"mode{mode}" / scene
+                skipped = [{"source_frame": 7, "reason": "camera cut resets history"}] if scene == "cut" else []
+                if mode == 1:
+                    cases = [run_case(args, directory / f"pair_{frame:05d}", scene, mode, frame, size)
+                             for frame in range(4, 12) if not (scene == "cut" and frame == 7)]
+                else:
+                    cases = [run_case(args, directory, scene, mode, size=size)]
+                result = {"scene": scene, "mode": mode, "size": size, "status": combined_status(cases),
+                          "completed": all(row["completed"] for row in cases), "cases": cases,
+                          "skipped": skipped}
+                measured = [row for row in cases if row["completed"]]
+                result["generated_frames"] = sum(row["generated_frames"] for row in measured)
+                for key in ("max_frame_rgb_mae", "max_channel_error", "max_over_2_fraction"):
+                    result[key] = max((row[key] for row in measured), default=None)
+                results.append(result)
+                expected = len(args.sizes) * len(args.modes) * len(SCENES)
+                size_results = []
+                for completed_size in args.sizes:
+                    rows = [row for row in results if row["size"] == completed_size]
+                    size_results.append({"size": completed_size,
+                                         "status": combined_status(rows) if len(rows) == len(args.modes) * len(SCENES) else ("running" if rows else "pending"),
+                                         "generated_frames": sum(row["generated_frames"] for row in rows)})
+                report = {"schema": "xefg.render_matrix/3", "modes": args.modes, "sizes": args.sizes,
+                          "package_profiles": profiles, "size_results": size_results,
+                          "status": combined_status(results) if len(results) == expected else "running",
+                          "scenes": results, "exit_codes": {"pass": 0, "run_failed": 1, "quality_failed": 2}}
+                write_summary(output, report)
+    return {"pass": 0, "run_failed": 1, "quality_failed": 2}[combined_status(results)]
 
 
 if __name__ == "__main__":

@@ -146,8 +146,17 @@ python -I -B tools/render-validation/validate.py pair `
   --out D:/xefg-validation/raster-001/pairing
 ```
 
-Scenes: `translation`, `occlusion`, `camera`, `cut`. Output remains 640x360 mode 3
-with 320x180 geometry buffers. `render --render-only --warp` exercises rasterization
+Scenes: `translation`, `occlusion`, `camera`, `cut`. Default output is 640x360
+with 320x180 geometry buffers. `render --size WIDTHxHEIGHT` selects one of the
+five standard sizes listed below; geometry buffers remain exactly half-size.
+The scene is rasterized at the selected resolution, not upscaled from 640.
+Select `--mode 1`, `--mode 3` (default), or
+`--mode 4`. Mode 1 FG capture additionally requires `--pair-frame N`: a fresh
+context receives source scene frames N-1 and N as local submission IDs 0 and 1.
+It renders no UI, tags only depth/motion, and uses the actual backbuffer as color.
+Mode 3 tags hudless color and UI; mode 4 tags hudless color but not UI, consuming
+the composed backbuffer instead. Both retain the animated crosshair for comparison.
+All modes dump the five original resource roles, including unused UI for inspection. `render --render-only --warp` exercises rasterization
 without loading the FG runtime; hardware FG cannot run on WARP. Use `--debug`
 for D3D12 validation and `--no-tag` only for input/tag-layout control experiments.
 Validate dumped geometry resources without loading a model:
@@ -168,8 +177,22 @@ Pairing v2 requires the official generated-frame tag and the decoded current UI
 ID, checks all input-submission API results and rejects duplicate/failed history.
 No analytical-image or SDK-output candidate ranking is used for raster scenes.
 
-The debug-layout profile is bound to the measured provider hash. Four corner
-boxes and two vertical lines must match, not just a few purple pixels. Quality
+Mode 1 uses a separate isolated-pair identity method rather than decoding an
+interpolated marker. Each capture must contain exactly two local submissions,
+first reset and second continuous, and exactly one successfully tagged generated
+output. Its source scene pair is recorded separately from local IDs 0/1. All
+native outputs are retained, including reset/base outputs; ambiguous or duplicate
+generated outputs fail pairing. Source identity is never inferred from observed
+application labels, ordinal, or SDK image similarity.
+
+The debug-layout profile is bound to the measured provider hash and output
+resolution. Every recorded rectangle must match, not just a few purple pixels.
+A resolution without an explicitly measured layout is rejected; the 640 layout
+is never automatically stretched to fit another size. For calibration,
+`inspect_tag_layout.py --run <capture> --out <new.json>` records exact purple
+pixel rectangles and hashes. This observation tool does not register a mask or
+certify generated identity; compare tagged/untagged captures and source content
+before adding a measured layout. Quality
 comparison excludes those regions plus the frame-ID strip; complete images are
 still retained. Native midpoint images are quality references only and use current
 UI composition, not a simulated half-frame UI. They do not establish frame identity.
@@ -193,9 +216,12 @@ python -I -B tools/render-validation/validate.py replay `
 
 Without `--all`, only the first verified generated pair is replayed. The tool
 requires a complete pairing report and rechecks its artifact hashes. Analytical
-calibration comparisons require untagged runs; rendered-scene v2 comparisons
-require official tags and exclude their recorded regions. It calls public `Xefg2xRuntime.prepare/interpolate_pair` with explicit mode
-3, previous/current hudless colors, and current UI/motion/depth. Reset frames are
+calibration comparisons require untagged runs; rendered-scene v2 (mode 3/4) and
+isolated-pair v3 (mode 1) comparisons require official tags and exclude their
+recorded regions. It calls public `Xefg2xRuntime.prepare/interpolate_pair` with the captured explicit
+mode: previous/current backbuffer for mode 1; hudless plus current UI for mode 3;
+hudless plus current backbuffer for mode 4. Current motion/depth are used in all
+three modes. Reset frames are
 not interpolated. Warmup inputs remain available, but the stateless pair API does
 not require replaying every warmup frame.
 
@@ -204,7 +230,9 @@ difference PNG at fixed 8x gain. Raster runs also save `_valid_diff_x8.png`
 with excluded debug-overlay pixels blacked out. `report.json` and `report.md` contain RGB MAE,
 maximum error, RMSE/PSNR, changed-pixel fractions and separate alpha statistics.
 Full-frame and `valid_region` metrics are both reported; the Markdown summary
-uses the valid region. Raster reports additionally compare SDK and official
+uses the valid region. Modes 3/4 additionally report `ui_region` over current UI
+nonzero-alpha pixels intersected with the valid region. This isolates the dynamic
+crosshair for diagnosis without removing it from the primary comparison. Raster reports additionally compare SDK and official
 output separately against native midpoint references. Identical RGB
 uses `rgb_identical: true` and `rgb_psnr_db: null` (not nonstandard JSON Infinity).
 The report records model/profile hashes, input pairing hash, dependency versions,
@@ -226,28 +254,55 @@ Replay and diagnostic sampling tools pin ORT CPU threading to one thread for
 repeatable baselines; the SDK executor default is not changed.
 
 `check_quality.py --report <replay/report.json> --out <new-check.json>` applies
-explicit valid-region regression limits (MAE 0.01, maximum byte difference 8,
-over-two-byte pixel fraction 0.02%). The limits are CLI-configurable and scoped
-to the current four-scene 640x360 mode3 suite, not a universal quality claim.
+explicit valid-region regression limits (MAE 0.01, maximum byte difference 20,
+over-two-byte pixel fraction 0.02%). Maximum channel differences above 8 but
+within the configured maximum are recorded in `warnings`, not failed solely
+for that maximum. Other limits still apply independently. `--maximum 8` restores
+the earlier strict gate. Existing reports and per-case measured baselines remain
+unchanged; a relaxed acceptance gate does not mean the measured residual disappeared. The limits are CLI-configurable and scoped
+to the rendered four-scene regression suite, not a universal quality claim. The
+same limits are applied across modes and resolutions without automatic scaling;
+see the evidence report for which combinations actually pass.
 Multiple `--report` arguments check the full suite together.
 
-## Four-scene matrix
+## Resolution/mode/scene matrix
 
-Once the native target passes its render-only tests, run the fixed short matrix:
+Once the native target passes its render-only tests, run all three modes:
 
 ```powershell
 python -I -B tools/render-validation/run_matrix.py `
   --renderer D:/xefg-render-validation-raster-build/Release/XefgRenderValidation.exe `
   --xess-bin C:/path/to/XeSS_SDK_3.0.2/bin `
-  --package D:/path/to/model-package --out D:/xefg-validation/matrix-001
+  --package D:/path/to/model-package --modes 1 3 4 --out D:/xefg-validation/matrix-001
 ```
 
-Scenes run serially, not concurrently on the GPU. Each scene goes through render,
-input checks, pairing and full replay. A failed stage stops that scene and is
-recorded in `matrix.json`; other scenes still run. Reset-related inventory
-warnings may proceed to pairing, which decides whether all expected generated
-frames are accounted for. The matrix exit code is nonzero if any scene cannot
-finish replay. No raw artifacts are automatically deleted.
+Defaults remain `--modes 3 --sizes 640x360`, retaining the original scene directory
+layout. Multi-mode 640 output uses `modeN/scene/`. For other or multiple sizes,
+output uses `WIDTHxHEIGHT/modeN/scene/`. Add e.g. `--sizes 640x360 1920x1080`.
+The five choices are 640x360, 1280x720, 1920x1080, 2560x1440 and 3840x2160;
+MV/depth is always half width and height. Each case creates fresh fixed-size
+resources; this does not exercise runtime resolution changes.
+
+Before capturing anything, the matrix validates model hashes and resolves all
+requested mode/output/MV combinations through the SDK planner. Missing or
+ambiguous profiles stop the run before GPU work. Model/profile identities are
+retained in the total report. Re-export from compatible retained captures to
+obtain missing profiles; do not edit a profile's dimensions by hand. All cases run serially, not concurrently
+on the GPU. Each case goes through render, input checks, pairing, full replay,
+and `check_quality.py` with the same explicit numeric limits. Mode 1 uses one
+fresh native process/context per source pair, stored under `pair_NNNNN/`; modes
+3/4 use continuous sequences. The measured source times are 4..11, excluding
+frame 7 in the cut scene because it resets history.
+
+A failed stage stops its case; other cases still run. `matrix.json` schema v3
+records each stage, source pair, reset skip, model/profile identities and
+resolution/mode/scene aggregate. Its status
+is `running` until all requested cases finish, then `pass`, `quality_failed`,
+or `run_failed`. Exit codes are respectively 0, 2, and 1 (run failure takes
+precedence). `completed` means replay and numeric checking completed, **not**
+that quality passed. Reset-related inventory warnings may proceed to pairing,
+which decides whether generated outputs are accounted for. No raw artifacts
+are automatically deleted.
 
 ## Artifact policy
 

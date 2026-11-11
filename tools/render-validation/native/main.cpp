@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -26,6 +27,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -35,11 +37,15 @@ using namespace render_validation;
 
 namespace
 {
-constexpr uint32_t kWidth = kColorWidth;
-constexpr uint32_t kHeight = kColorHeight;
-constexpr uint32_t kMotionWidth = kGeometryWidth;
-constexpr uint32_t kMotionHeight = kGeometryHeight;
-constexpr const char* kRendererVersion = "xefg.render_validation.renderer/1";
+constexpr const char* kRendererVersion = "xefg.render_validation.renderer/2";
+
+constexpr RenderSize kSupportedRenderSizes[] = {
+    {640, 360},
+    {1280, 720},
+    {1920, 1080},
+    {2560, 1440},
+    {3840, 2160},
+};
 
 struct Options
 {
@@ -48,6 +54,9 @@ struct Options
     std::string adapterFilter;
     std::string scene = "translation";
     std::string shaderPath;
+    RenderSize size;
+    uint32_t mode = 3;
+    std::optional<uint32_t> pairFrame;
     uint32_t frames = kMeasuredFrames;
     uint32_t warmup = kWarmupFrames;
     uint32_t pacingMilliseconds = 16;
@@ -100,12 +109,46 @@ std::filesystem::path ExecutableDirectory()
     return std::filesystem::path(path).parent_path();
 }
 
+bool ParseUint(const std::string& text, uint32_t& value)
+{
+    if (text.empty()) return false;
+    uint32_t parsed = 0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed);
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) return false;
+    value = parsed;
+    return true;
+}
+
+bool ParseRenderSize(const std::string& text, RenderSize& size)
+{
+    const size_t separator = text.find_first_of("xX");
+    if (separator == std::string::npos) return false;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (!ParseUint(text.substr(0, separator), width)
+        || !ParseUint(text.substr(separator + 1), height))
+        return false;
+    for (const RenderSize& supported : kSupportedRenderSizes)
+    {
+        if (width == supported.width && height == supported.height)
+        {
+            size = supported;
+            return true;
+        }
+    }
+    return false;
+}
+
 void Usage()
 {
     std::puts(
         "XefgRenderValidation --out <new-dir> [options]\n"
         "  --xess-dir <dir>        folder containing libxess_fg.dll/libxell.dll\n"
         "  --scene NAME            translation|occlusion|camera|cut (default translation)\n"
+        "  --mode N                UI mode 1|3|4 (default 3)\n"
+        "  --size WxH              output size 640x360|1280x720|1920x1080|2560x1440|"
+        "3840x2160 (default 640x360)\n"
+        "  --pair-frame N          mode 1 only: one isolated source pair [N-1,N]\n"
         "  --frames N              measured frames after warmup (default 8)\n"
         "  --warmup N              warmup frames (default 4)\n"
         "  --pacing-ms N           application frame pacing (default 16)\n"
@@ -138,6 +181,17 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error)
         else if (argument == "--adapter") options.adapterFilter = value(i, argument);
         else if (argument == "--scene") options.scene = value(i, argument);
         else if (argument == "--shader") options.shaderPath = value(i, argument);
+        else if (argument == "--size")
+        {
+            if (!ParseRenderSize(value(i, argument), options.size))
+            {
+                error = "--size must be one of 640x360, 1280x720, 1920x1080, "
+                    "2560x1440, 3840x2160";
+                return false;
+            }
+        }
+        else if (argument == "--mode") options.mode = std::stoul(value(i, argument));
+        else if (argument == "--pair-frame") options.pairFrame = std::stoul(value(i, argument));
         else if (argument == "--frames") options.frames = std::stoul(value(i, argument));
         else if (argument == "--warmup") options.warmup = std::stoul(value(i, argument));
         else if (argument == "--pacing-ms") options.pacingMilliseconds = std::stoul(value(i, argument));
@@ -164,6 +218,28 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error)
         error = "--scene expects translation, occlusion, camera, or cut";
         return false;
     }
+    if (options.mode != 1 && options.mode != 3 && options.mode != 4)
+    {
+        error = "--mode must be 1, 3, or 4";
+        return false;
+    }
+    if (options.pairFrame)
+    {
+        if (options.mode != 1)
+        {
+            error = "--pair-frame is only valid with --mode 1";
+            return false;
+        }
+        SceneKind pairScene = SceneKind::Translation;
+        SceneFromName(options.scene, pairScene);
+        if (*options.pairFrame > 65535
+            || !IsValidPairFrame(pairScene, *options.pairFrame))
+        {
+            error = "--pair-frame must be in 1..65535 and must not cross the camera-cut "
+                "discontinuity (frame 7)";
+            return false;
+        }
+    }
     if (options.frames < 1 || options.frames > 65532)
     {
         error = "--frames must be in 1..65532";
@@ -182,6 +258,13 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error)
     {
         error = "XeFG frame generation requires a hardware adapter; use --render-only with --warp";
         return false;
+    }
+    if (options.pairFrame)
+    {
+        // An isolated pair is a fresh two-submission process; the wrapper may
+        // still pass its usual --frames/--warmup values, which are overridden.
+        options.warmup = 0;
+        options.frames = 2;
     }
     if (options.xessDirectory.empty()) options.xessDirectory = Narrow(ExecutableDirectory().wstring());
     return true;
@@ -235,6 +318,28 @@ bool ParseSceneKind(const std::string& name, SceneKind& scene)
     return SceneFromName(name, scene);
 }
 
+struct ModeInfo
+{
+    xefg_swapchain_ui_mode_t uiMode;
+    const char* requested;
+    bool ui;
+    bool uiTextureTagged;
+    bool uiComposition;
+};
+
+ModeInfo ModeFor(uint32_t mode)
+{
+    switch (mode)
+    {
+    case 1: return {XEFG_SWAPCHAIN_UI_MODE_NONE, "none", false, false, false};
+    case 4: return {XEFG_SWAPCHAIN_UI_MODE_BACKBUFFER_HUDLESS, "backbuffer-hudless",
+        true, false, true};
+    case 3:
+    default: return {XEFG_SWAPCHAIN_UI_MODE_HUDLESS_UITEXTURE, "hudless-uitexture",
+        true, true, true};
+    }
+}
+
 std::string FrameFile(const char* prefix, uint32_t frame, const char* extension)
 {
     char text[64]{};
@@ -267,7 +372,7 @@ bool ReadbackChecked(ID3D12Resource* resource, size_t expectedBytes, std::vector
 }
 
 bool WriteFrameInputs(const std::filesystem::path& directory, uint32_t frame, Renderer& renderer,
-    std::string& error)
+    const RenderSize& size, std::string& error)
 {
     struct Item
     {
@@ -277,8 +382,9 @@ bool WriteFrameInputs(const std::filesystem::path& directory, uint32_t frame, Re
         size_t bytes;
         const char* label;
     };
-    const size_t colorBytes = static_cast<size_t>(kWidth) * kHeight * 4;
-    const size_t geometryBytes = static_cast<size_t>(kMotionWidth) * kMotionHeight * 4;
+    const size_t colorBytes = static_cast<size_t>(size.width) * size.height * 4;
+    const size_t geometryBytes = static_cast<size_t>(size.GeometryWidth())
+        * size.GeometryHeight() * 4;
     const Item items[] = {
         {"color", "bgra", renderer.Color(), colorBytes, "color"},
         {"ui", "bgra", renderer.Ui(), colorBytes, "ui"},
@@ -340,11 +446,12 @@ int32_t TagResource(oracle::Runtime& runtime, xefg_swapchain_handle_t fg,
 }
 
 // Copies the renderer's current backbuffer into the provider proxy swap chain,
-// then records the four public input tags on the same command list.  The caller
+// then records the applicable public input tags on the same command list.  The caller
 // has already rendered and read back the same resources.
 bool CopyBackbufferAndTag(WarpFixture& fixture, IDXGISwapChain3* proxy, Renderer& renderer,
-    oracle::Runtime& runtime, xefg_swapchain_handle_t fg, uint32_t frame,
-    std::array<int32_t, 6>& submissionResults, std::string& error)
+    const RenderSize& size, oracle::Runtime& runtime, xefg_swapchain_handle_t fg, uint32_t frame,
+    bool tagColor, bool tagUi, std::array<std::optional<int32_t>, 6>& submissionResults,
+    std::string& error)
 {
     ComPtr<ID3D12Resource> target;
     if (FAILED(proxy->GetBuffer(proxy->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&target))) || !target)
@@ -353,10 +460,13 @@ bool CopyBackbufferAndTag(WarpFixture& fixture, IDXGISwapChain3* proxy, Renderer
         return false;
     }
     const D3D12_RESOURCE_DESC targetDesc = target->GetDesc();
-    if (targetDesc.Format != kColorFormat || targetDesc.Width != kWidth || targetDesc.Height != kHeight
-        || targetDesc.DepthOrArraySize != 1)
+    if (targetDesc.Format != kColorFormat || targetDesc.Width != size.width
+        || targetDesc.Height != size.height || targetDesc.DepthOrArraySize != 1)
     {
-        error = "proxy back buffer is not a 640x360 BGRA8 texture";
+        std::ostringstream text;
+        text << "proxy back buffer is not a " << size.width << "x" << size.height
+             << " BGRA8 texture";
+        error = text.str();
         return false;
     }
     if (!fixture.SubmitAndWait())
@@ -371,13 +481,23 @@ bool CopyBackbufferAndTag(WarpFixture& fixture, IDXGISwapChain3* proxy, Renderer
         D3D12_RESOURCE_STATE_PRESENT);
 
     submissionResults[0] = TagResource(runtime, fg, fixture.commands.Get(), frame,
-        XEFG_SWAPCHAIN_RES_DEPTH, renderer.Depth(), kMotionWidth, kMotionHeight);
+        XEFG_SWAPCHAIN_RES_DEPTH, renderer.Depth(), size.GeometryWidth(),
+        size.GeometryHeight());
     submissionResults[1] = TagResource(runtime, fg, fixture.commands.Get(), frame,
-        XEFG_SWAPCHAIN_RES_MOTION_VECTOR, renderer.Motion(), kMotionWidth, kMotionHeight);
-    submissionResults[2] = TagResource(runtime, fg, fixture.commands.Get(), frame,
-        XEFG_SWAPCHAIN_RES_HUDLESS_COLOR, renderer.Color(), kWidth, kHeight);
-    submissionResults[3] = TagResource(runtime, fg, fixture.commands.Get(), frame,
-        XEFG_SWAPCHAIN_RES_UI, renderer.Ui(), kWidth, kHeight);
+        XEFG_SWAPCHAIN_RES_MOTION_VECTOR, renderer.Motion(), size.GeometryWidth(),
+        size.GeometryHeight());
+    // UI mode 1 interpolates the backbuffer and has no hudless-color input, so
+    // its color submission is skipped and recorded as null.
+    if (tagColor)
+    {
+        submissionResults[2] = TagResource(runtime, fg, fixture.commands.Get(), frame,
+            XEFG_SWAPCHAIN_RES_HUDLESS_COLOR, renderer.Color(), size.width, size.height);
+    }
+    if (tagUi)
+    {
+        submissionResults[3] = TagResource(runtime, fg, fixture.commands.Get(), frame,
+            XEFG_SWAPCHAIN_RES_UI, renderer.Ui(), size.width, size.height);
+    }
     return SubmitRecorded(fixture, error);
 }
 
@@ -496,18 +616,19 @@ bool WriteDebugMessages(const std::filesystem::path& path, ID3D12Device* device,
     return true;
 }
 
-std::string ResetFramesJson(SceneKind scene, uint32_t warmup, uint32_t frames)
+std::string ResetFramesJson(SceneKind scene, uint32_t warmup, uint32_t frames, bool isolatedPair)
 {
     std::ostringstream text;
     text << "[0";
-    if (scene == SceneKind::Cut && kCutFrame < warmup + frames)
+    if (!isolatedPair && scene == SceneKind::Cut && kCutFrame < warmup + frames)
         text << ", " << kCutFrame;
     text << "]";
     return text.str();
 }
 
 bool WriteMetaJson(const std::filesystem::path& path, const Options& options, SceneKind scene,
-    bool warp, const std::string& adapterName, const DXGI_ADAPTER_DESC1& adapterDescription,
+    const RenderSize& size, bool warp, const std::string& adapterName,
+    const DXGI_ADAPTER_DESC1& adapterDescription,
     const std::string& luid, const std::string& moduleHash, const std::string& shaderSource,
     const std::string& shaderHash, const SetupResults& setup, uint32_t maxInterpolatedFrames,
     bool initializationFallback, int64_t qpcFrequency, std::string& error)
@@ -536,13 +657,23 @@ bool WriteMetaJson(const std::filesystem::path& path, const Options& options, Sc
     file << "  \"shader_source\": \"" << JsonEscape(shaderSource) << "\",\n";
     file << "  \"shader_sha256\": \"" << shaderHash << "\",\n";
     file << "  \"qpc_frequency\": " << qpcFrequency << ",\n";
+    const ModeInfo mode = ModeFor(options.mode);
     file << "  \"configuration\": {"
-         << "\"width\": " << kWidth << ", \"height\": " << kHeight
-         << ", \"motion_width\": " << kMotionWidth << ", \"motion_height\": " << kMotionHeight
+         << "\"width\": " << size.width << ", \"height\": " << size.height
+         << ", \"motion_width\": " << size.GeometryWidth()
+         << ", \"motion_height\": " << size.GeometryHeight()
+         << ", \"mode\": " << options.mode
          << ", \"scene\": \"" << JsonEscape(options.scene) << "\", \"scene_revision\": 1"
-         << ", \"ui\": true, \"ui_texture_tagged\": true, \"ui_mode\": 3"
-         << ", \"ui_mode_requested\": \"hudless-uitexture\", \"ui_mode_explicit\": true"
-         << ", \"max_interpolated_frames\": " << maxInterpolatedFrames
+         << ", \"ui\": " << (mode.ui ? "true" : "false")
+         << ", \"ui_texture_tagged\": " << (mode.uiTextureTagged ? "true" : "false")
+         << ", \"ui_mode\": " << int(mode.uiMode)
+         << ", \"ui_mode_requested\": \"" << mode.requested << "\", \"ui_mode_explicit\": true"
+         << ", \"ui_composition_enabled\": " << (mode.uiComposition ? "true" : "false")
+         << ", \"pairing_method\": \"" << (options.pairFrame ? "isolated_pair" : "sequential") << "\""
+         << ", \"pair_frame\": ";
+    if (options.pairFrame) file << *options.pairFrame;
+    else file << "null";
+    file << ", \"max_interpolated_frames\": " << maxInterpolatedFrames
          << ", \"initialization_fallback\": " << (initializationFallback ? "true" : "false")
          << ", \"frames\": " << options.frames << ", \"warmup\": " << options.warmup
          << ", \"pacing_ms\": " << options.pacingMilliseconds
@@ -551,7 +682,8 @@ bool WriteMetaJson(const std::filesystem::path& path, const Options& options, Sc
          << ((!options.renderOnly && options.tagInterpolated) ? "true" : "false")
          << ", \"render_only\": " << (options.renderOnly ? "true" : "false")
          << ", \"fg_matrix_control\": \"" << (options.identityFgMatrices ? "identity" : "rendered") << "\""
-         << ", \"reset_frames\": " << ResetFramesJson(scene, options.warmup, options.frames)
+         << ", \"reset_frames\": "
+         << ResetFramesJson(scene, options.warmup, options.frames, options.pairFrame.has_value())
          << ", \"debug_layer\": " << (options.debugLayer ? "true" : "false") << "},\n";
     file << "  \"api_results\": {"
          << "\"create_context\": " << setup.createContext
@@ -560,8 +692,10 @@ bool WriteMetaJson(const std::filesystem::path& path, const Options& options, Sc
          << ", \"get_swap_chain\": " << setup.getSwapChain
          << ", \"set_num_interpolated_frames\": " << setup.setNumInterpolatedFrames
          << ", \"set_enabled\": " << setup.setEnabled
-         << ", \"set_ui_composition_state\": " << setup.setUiCompositionState
-         << ", \"enable_only_interpolation\": " << setup.enableOnlyInterpolation
+         << ", \"set_ui_composition_state\": ";
+    if (mode.uiComposition) file << setup.setUiCompositionState;
+    else file << "null"; // Mode 1 never calls the composition API.
+    file << ", \"enable_only_interpolation\": " << setup.enableOnlyInterpolation
          << ", \"enable_tag_interpolated\": " << setup.enableTagInterpolated
          << ", \"get_properties\": " << setup.getProperties
          << ", \"destroy\": " << setup.destroy << "}\n";
@@ -612,6 +746,7 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "unsupported scene: %s\n", options.scene.c_str());
         return 2;
     }
+    const RenderSize renderSize = options.size;
 
     const std::filesystem::path outputDirectory = Widen(options.outputDirectory);
     if (!PrepareOutput(outputDirectory, error))
@@ -688,7 +823,8 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "D3D12 device/queue initialization failed\n");
         return 1;
     }
-    TestWindow window(L"XefgRenderValidationWindow", static_cast<LONG>(kWidth), static_cast<LONG>(kHeight));
+    TestWindow window(L"XefgRenderValidationWindow", static_cast<LONG>(renderSize.width),
+        static_cast<LONG>(renderSize.height));
     if (!window.window)
     {
         std::fprintf(stderr, "window creation failed\n");
@@ -698,7 +834,8 @@ int main(int argc, char** argv)
     window.Pump(2);
 
     Renderer renderer;
-    if (!renderer.Initialize(fixture.device.Get(), fixture.queue.Get(), shaderPath, error))
+    if (!renderer.Initialize(fixture.device.Get(), fixture.queue.Get(), shaderPath, error,
+        renderSize))
     {
         std::fprintf(stderr, "renderer initialization failed: %s\n", error.c_str());
         return 1;
@@ -722,6 +859,7 @@ int main(int argc, char** argv)
     int32_t onlyInterpolationResult = 0;
     int32_t tagInterpolatedResult = 0;
     const bool tagRequested = !options.renderOnly && options.tagInterpolated;
+    const ModeInfo modeInfo = ModeFor(options.mode);
 
     if (!options.renderOnly)
     {
@@ -742,8 +880,8 @@ int main(int argc, char** argv)
         }
 
         DXGI_SWAP_CHAIN_DESC1 chainDescription{};
-        chainDescription.Width = kWidth;
-        chainDescription.Height = kHeight;
+        chainDescription.Width = renderSize.width;
+        chainDescription.Height = renderSize.height;
         chainDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         chainDescription.SampleDesc.Count = 1;
         chainDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -788,7 +926,7 @@ int main(int argc, char** argv)
         initParameters.pApplicationSwapChain = nullptr;
         initParameters.initFlags = 0;
         initParameters.maxInterpolatedFrames = 1;
-        initParameters.uiMode = XEFG_SWAPCHAIN_UI_MODE_HUDLESS_UITEXTURE;
+        initParameters.uiMode = modeInfo.uiMode;
         setup.init = static_cast<int32_t>(runtime.xefgSwapChainD3D12InitFromSwapChainDesc(fg, window.window,
             &chainDescription, nullptr, fixture.queue.Get(), captureFactory.Get(), &initParameters));
         if (setup.init != int32_t(XEFG_SWAPCHAIN_RESULT_SUCCESS))
@@ -816,8 +954,12 @@ int main(int argc, char** argv)
         setup.setNumInterpolatedFrames =
             static_cast<int32_t>(runtime.xefgSwapChainSetNumInterpolatedFrames(fg, 1));
         setup.setEnabled = static_cast<int32_t>(runtime.xefgSwapChainSetEnabled(fg, 1));
-        setup.setUiCompositionState = static_cast<int32_t>(runtime.xefgSwapChainSetUiCompositionState(
-            fg, XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED));
+        if (modeInfo.uiComposition)
+        {
+            setup.setUiCompositionState = static_cast<int32_t>(
+                runtime.xefgSwapChainSetUiCompositionState(
+                    fg, XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED));
+        }
         onlyInterpolationResult = static_cast<int32_t>(runtime.xefgSwapChainEnableDebugFeature(
             fg, XEFG_SWAPCHAIN_DEBUG_FEATURE_SHOW_ONLY_INTERPOLATION, 1, nullptr));
         setup.enableOnlyInterpolation = onlyInterpolationResult;
@@ -831,11 +973,12 @@ int main(int argc, char** argv)
         xefg_swapchain_properties_t properties{};
         setup.getProperties = static_cast<int32_t>(runtime.xefgSwapChainD3D12GetProperties(
             fg, &initParameters, 0, 0, DXGI_FORMAT_UNKNOWN, &properties));
-        std::printf("XeFG ready: uiMode=%d maxInterpolations=%u descriptors=%u fallback=%s\n",
-            int(XEFG_SWAPCHAIN_UI_MODE_HUDLESS_UITEXTURE), properties.maxSupportedInterpolations,
+        std::printf("XeFG ready: mode=%u uiMode=%d maxInterpolations=%u descriptors=%u fallback=%s\n",
+            options.mode, int(modeInfo.uiMode), properties.maxSupportedInterpolations,
             properties.requiredDescriptorCount, initializationFallback ? "yes" : "no");
     }
 
+    const bool isolatedPair = options.pairFrame.has_value();
     const uint32_t totalFrames = options.warmup + options.frames;
     std::vector<SceneFrameRecord> sceneFrames;
     sceneFrames.reserve(totalFrames);
@@ -845,32 +988,56 @@ int main(int argc, char** argv)
     if (!options.renderOnly
         && (setup.createContext != 0 || setup.init != 0 || setup.getSwapChain != 0
             || setup.setNumInterpolatedFrames != 0 || setup.setEnabled != 0
-            || setup.setUiCompositionState != 0 || onlyInterpolationResult != 0
+            || (modeInfo.uiComposition && setup.setUiCompositionState != 0)
+            || onlyInterpolationResult != 0
             || (tagRequested && tagInterpolatedResult != 0) || setup.getProperties != 0))
         apiFailure = true;
 
     for (uint32_t frame = 0; frame < totalFrames; ++frame)
     {
-        const bool resetHistory = (frame == 0) || IsCutResetFrame(frame, sceneKind);
-        FrameState state = MakeFrameState(sceneKind, frame, false);
-        state.historyReset = resetHistory;
-        FrameState midpointState = MakeFrameState(sceneKind, frame, true);
-        midpointState.historyReset = resetHistory;
+        // Local submission index (tags, status, capture labels) versus the
+        // rendering source frame/time.  They are identical sequentially and
+        // differ in isolated-pair mode.
+        const uint32_t localFrame = frame;
+        uint32_t sourceFrame = localFrame;
+        bool resetHistory = false;
+        FrameState state;
+        FrameState midpointState;
+        if (isolatedPair)
+        {
+            sourceFrame = *options.pairFrame - 1u + localFrame;
+            const bool firstOfPair = localFrame == 0;
+            state = MakeIsolatedPairFrameState(sceneKind, sourceFrame, firstOfPair, false);
+            midpointState = MakeIsolatedPairFrameState(sceneKind, sourceFrame, firstOfPair, true);
+            resetHistory = state.historyReset;
+        }
+        else
+        {
+            resetHistory = (localFrame == 0) || IsCutResetFrame(localFrame, sceneKind);
+            state = MakeFrameState(sceneKind, sourceFrame, false);
+            state.historyReset = resetHistory;
+            midpointState = MakeFrameState(sceneKind, sourceFrame, true);
+            midpointState.historyReset = resetHistory;
+        }
+        state.uiEnabled = modeInfo.ui;
+        midpointState.uiEnabled = modeInfo.ui;
 
         if (!renderer.Render(midpointState, sceneKind, true, error))
         {
-            std::fprintf(stderr, "midpoint render failed at frame %u: %s\n", frame, error.c_str());
+            std::fprintf(stderr, "midpoint render failed at frame %u: %s\n", localFrame, error.c_str());
             return 1;
         }
-        const std::string midpointName = "native_mid/" + FrameFile("frame", frame, "bgra");
+        const std::string midpointName = "native_mid/" + FrameFile("frame", localFrame, "bgra");
         std::vector<uint8_t> midpointBytes;
-        if (!ReadbackChecked(renderer.Backbuffer(), static_cast<size_t>(kWidth) * kHeight * 4,
+        if (!ReadbackChecked(renderer.Backbuffer(),
+            static_cast<size_t>(renderSize.width) * renderSize.height * 4,
             midpointBytes, "midpoint backbuffer", error))
         {
             std::fprintf(stderr, "%s\n", error.c_str());
             return 1;
         }
-        if (!WriteRawFile(nativeMidpointDirectory / FrameFile("frame", frame, "bgra"), midpointBytes, error))
+        if (!WriteRawFile(nativeMidpointDirectory / FrameFile("frame", localFrame, "bgra"),
+            midpointBytes, error))
         {
             std::fprintf(stderr, "%s\n", error.c_str());
             return 1;
@@ -878,19 +1045,20 @@ int main(int argc, char** argv)
 
         if (!renderer.Render(state, sceneKind, false, error))
         {
-            std::fprintf(stderr, "current render failed at frame %u: %s\n", frame, error.c_str());
+            std::fprintf(stderr, "current render failed at frame %u: %s\n", localFrame, error.c_str());
             return 1;
         }
-        if (!WriteFrameInputs(applicationInputsDirectory, frame, renderer, error))
+        if (!WriteFrameInputs(applicationInputsDirectory, localFrame, renderer, renderSize, error))
         {
-            std::fprintf(stderr, "input readback failed at frame %u: %s\n", frame, error.c_str());
+            std::fprintf(stderr, "input readback failed at frame %u: %s\n", localFrame, error.c_str());
             return 1;
         }
 
         SceneFrameRecord record;
-        record.index = frame;
-        record.hasPrevious = frame > 0;
-        record.previousFrame = frame > 0 ? frame - 1 : 0;
+        record.index = localFrame;
+        record.sceneFrame = sourceFrame;
+        record.hasPrevious = localFrame > 0;
+        record.previousFrame = localFrame > 0 ? localFrame - 1 : 0;
         record.resetHistory = resetHistory;
         record.midpoint = midpointName;
         std::memcpy(record.view.data(), state.view.m, sizeof(state.view.m));
@@ -914,10 +1082,11 @@ int main(int argc, char** argv)
             continue;
         }
 
-        if (!CopyBackbufferAndTag(fixture, proxy.Get(), renderer, runtime, fg, frame,
-            record.submissionResults, error))
+        if (!CopyBackbufferAndTag(fixture, proxy.Get(), renderer, renderSize, runtime, fg, localFrame,
+            modeInfo.ui, modeInfo.uiTextureTagged, record.submissionResults, error))
         {
-            std::fprintf(stderr, "backbuffer/tag submission failed at frame %u: %s\n", frame, error.c_str());
+            std::fprintf(stderr, "backbuffer/tag submission failed at frame %u: %s\n",
+                localFrame, error.c_str());
             return 1;
         }
 
@@ -937,12 +1106,14 @@ int main(int argc, char** argv)
         constants.resetHistory = resetHistory ? 1u : 0u;
         constants.frameRenderTime = static_cast<float>(options.pacingMilliseconds);
         record.submissionResults[4] = static_cast<int32_t>(
-            runtime.xefgSwapChainTagFrameConstants(fg, frame, &constants));
+            runtime.xefgSwapChainTagFrameConstants(fg, localFrame, &constants));
         record.submissionResults[5] = static_cast<int32_t>(
-            runtime.xefgSwapChainSetPresentId(fg, frame));
+            runtime.xefgSwapChainSetPresentId(fg, localFrame));
 
-        capture->SetFrameIndex(frame);
-        capture->SetEnabled(frame >= options.warmup);
+        capture->SetFrameIndex(localFrame);
+        // Isolated-pair runs capture both submissions so neither the reset base
+        // nor the single eligible generated pair can be hidden.
+        capture->SetEnabled(isolatedPair || localFrame >= options.warmup);
         LARGE_INTEGER presentStart{}, presentEnd{};
         QueryPerformanceCounter(&presentStart);
         const HRESULT presentResult = proxy->Present(0, 0);
@@ -950,7 +1121,7 @@ int main(int argc, char** argv)
         xefg_swapchain_present_status_t status{};
         const auto statusResult = runtime.xefgSwapChainGetLastPresentStatus(fg, &status);
         PresentStatusRecord statusRecord;
-        statusRecord.applicationFrame = frame;
+        statusRecord.applicationFrame = localFrame;
         statusRecord.presentResult = static_cast<int32_t>(presentResult);
         statusRecord.statusResult = static_cast<int32_t>(statusResult);
         statusRecord.framesPresented = status.framesPresented;
@@ -959,13 +1130,16 @@ int main(int argc, char** argv)
         statusRecord.presentStartQpc = static_cast<uint64_t>(presentStart.QuadPart);
         statusRecord.presentEndQpc = static_cast<uint64_t>(presentEnd.QuadPart);
         statuses.push_back(statusRecord);
+        const bool submissionSucceeded = std::all_of(record.submissionResults.begin(),
+            record.submissionResults.end(), [](const std::optional<int32_t>& result) {
+                return !result || *result == 0;
+            });
         if (presentResult != S_OK || statusResult != XEFG_SWAPCHAIN_RESULT_SUCCESS
-            || record.submissionResults[4] != 0 || record.submissionResults[5] != 0
-            || record.submissionResults[0] != 0 || record.submissionResults[1] != 0
-            || record.submissionResults[2] != 0 || record.submissionResults[3] != 0)
+            || !submissionSucceeded)
             apiFailure = true;
-        std::printf("frame %u: present=0x%08lx framesPresented=%u result=%d\n", frame,
-            static_cast<unsigned long>(presentResult), status.framesPresented, int(status.frameGenResult));
+        std::printf("frame %u (scene %u): present=0x%08lx framesPresented=%u result=%d\n",
+            localFrame, sourceFrame, static_cast<unsigned long>(presentResult),
+            status.framesPresented, int(status.frameGenResult));
         if (options.pacingMilliseconds) Sleep(options.pacingMilliseconds);
         sceneFrames.push_back(std::move(record));
     }
@@ -976,8 +1150,9 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    if (!WriteApplicationInputsManifest(applicationInputsDirectory, kWidth, kHeight, kMotionWidth,
-        kMotionHeight, options.warmup, options.frames, error))
+    if (!WriteApplicationInputsManifest(applicationInputsDirectory, renderSize.width,
+        renderSize.height, renderSize.GeometryWidth(), renderSize.GeometryHeight(),
+        options.warmup, options.frames, error))
     {
         std::fprintf(stderr, "%s\n", error.c_str());
         return 1;
@@ -985,10 +1160,18 @@ int main(int argc, char** argv)
     SceneManifest sceneManifest;
     sceneManifest.name = kSceneNames[static_cast<size_t>(sceneKind)];
     sceneManifest.revision = 1;
-    sceneManifest.width = kWidth;
-    sceneManifest.height = kHeight;
-    sceneManifest.motionWidth = kMotionWidth;
-    sceneManifest.motionHeight = kMotionHeight;
+    sceneManifest.mode = options.mode;
+    sceneManifest.pairingMethod = isolatedPair ? "isolated_pair" : "sequential";
+    sceneManifest.hasSourcePair = isolatedPair;
+    if (isolatedPair)
+    {
+        sceneManifest.sourcePair = {
+            *options.pairFrame - 1u, *options.pairFrame};
+    }
+    sceneManifest.width = renderSize.width;
+    sceneManifest.height = renderSize.height;
+    sceneManifest.motionWidth = renderSize.GeometryWidth();
+    sceneManifest.motionHeight = renderSize.GeometryHeight();
     sceneManifest.warmup = options.warmup;
     sceneManifest.measuredFrames = options.frames;
     sceneManifest.shaderSource = shaderSource;
@@ -1047,8 +1230,9 @@ int main(int argc, char** argv)
         if (capture) capture->SetEnabled(false);
     }
 
-    const bool metaWritten = WriteMetaJson(outputDirectory / L"meta.json", options, sceneKind, options.warp,
-        options.warp ? "Microsoft Basic Render Driver" : Narrow(adapterDescription.Description),
+    const bool metaWritten = WriteMetaJson(outputDirectory / L"meta.json", options, sceneKind,
+        renderSize, options.warp, options.warp ? "Microsoft Basic Render Driver"
+        : Narrow(adapterDescription.Description),
         adapterDescription, LuidString(fixture.device->GetAdapterLuid()), moduleHash, shaderSource,
         shaderHash, setup, maxInterpolatedFrames, initializationFallback, qpcFrequency.QuadPart, error);
     if (!metaWritten) std::fprintf(stderr, "%s\n", error.c_str());

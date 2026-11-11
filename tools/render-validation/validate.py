@@ -167,7 +167,11 @@ def render_capture(args):
     output.mkdir(parents=True, exist_ok=False)
     run = output / "capture"
     command = [str(args.renderer.resolve()), "--out", str(run), "--scene", args.scene,
-               "--frames", str(args.frames), "--warmup", "4", "--pacing-ms", str(args.pacing_ms)]
+               "--frames", str(args.frames), "--warmup", "4", "--pacing-ms", str(args.pacing_ms),
+               "--mode", str(getattr(args, "mode", 3)),
+               "--size", getattr(args, "size", "640x360")]
+    if getattr(args, "pair_frame", None) is not None:
+        command += ["--pair-frame", str(args.pair_frame)]
     if args.xess_bin:
         command += ["--xess-dir", str(args.xess_bin.resolve())]
     for flag in ("render_only", "warp", "debug", "no_tag"):
@@ -224,6 +228,10 @@ def main():
     render.add_argument("--xess-bin", type=Path)
     render.add_argument("--out", type=Path, required=True)
     render.add_argument("--scene", choices=("translation", "occlusion", "camera", "cut"), default="translation")
+    render.add_argument("--mode", type=int, choices=(1, 3, 4), default=3)
+    render.add_argument("--size", choices=("640x360", "1280x720", "1920x1080", "2560x1440", "3840x2160"),
+                        default="640x360")
+    render.add_argument("--pair-frame", type=int, help="Mode 1 isolated source pair ending at this scene frame")
     render.add_argument("--frames", type=int, default=8)
     render.add_argument("--pacing-ms", type=int, default=16)
     for flag in ("render-only", "warp", "debug", "no-tag"):
@@ -232,6 +240,11 @@ def main():
     if args.command == "render":
         if not 1 <= args.frames <= 65532 or args.pacing_ms < 0:
             parser.error("render requires 1..65532 measured frames and nonnegative pacing")
+        if args.pair_frame is not None and (args.mode != 1 or not 1 <= args.pair_frame <= 65535
+                                            or (args.scene == "cut" and args.pair_frame == 7)):
+            parser.error("--pair-frame requires mode 1, frame 1..65535 and no camera-cut crossing")
+        if args.mode == 1 and not args.render_only and args.pair_frame is None:
+            parser.error("Mode 1 FG validation requires --pair-frame to establish source identity")
         if not args.render_only and (not args.xess_bin or args.warp):
             parser.error("FG rendering requires --xess-bin and a hardware GPU")
         return render_capture(args)
