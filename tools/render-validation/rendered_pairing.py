@@ -19,7 +19,7 @@ ALLOWED_SIZES = ((640, 360), (1280, 720), (1920, 1080), (2560, 1440), (3840, 216
 # provider capture are registered here; no layout is inferred or scaled.
 TAG_LAYOUTS = {
     (PROFILED_PROVIDER, (640, 360)): TAG_RECTS,
-    # Measured in all three modes, with a no-tag control (2026-11-11).
+    # Measured in all three modes, with a no-tag control.
     (PROFILED_PROVIDER, (1280, 720)): [
         [0, 0, 64, 64], [1216, 0, 1280, 64], [48, 64, 64, 656],
         [1216, 64, 1232, 656], [0, 656, 64, 720], [1216, 656, 1280, 720]],

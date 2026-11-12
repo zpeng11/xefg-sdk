@@ -590,7 +590,8 @@ class CaptureMode3Tests(unittest.TestCase):
             mode = contract["variants"]["mode3"]
             self.assertEqual(mode["graph"]["original_inputs"], 319)
             self.assertEqual(mode["graph"]["original_outputs"], 42)
-            self.assertEqual(mode["graph"]["original_initializers"], 2497)
+            # Each of the 16 d25 sampler calls adds a fixed-point rounding divisor.
+            self.assertEqual(mode["graph"]["original_initializers"], 2513)
             self.assertEqual(len(mode["inputs"]), 319)
             self.assertEqual(len(mode["outputs"]), 42)
             by_name = {entry["graph_name"]: entry

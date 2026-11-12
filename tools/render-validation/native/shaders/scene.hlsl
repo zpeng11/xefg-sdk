@@ -18,6 +18,16 @@ cbuffer FrameConstants : register(b1)
     float4 FrameData; // x = UI/application frame id, y = midpoint, z = history reset, w = UI enabled
 };
 
+// Dedicated deformation constants for the nonrigid scene.  Values match the
+// constants in renderer.h and the scene.json extension.
+cbuffer DeformConstants : register(b2)
+{
+    float4 DeformPrimary;   // x=A1, y=kx, z=ky, w=w1
+    float4 DeformSecondary; // x=w2, y=A2, z=k2, w=w3
+    float4 DeformTimes;     // x=current time, y=previous time, z=phase2, w=flags
+    float4 DeformNormalScale; // xyz = inverse world scale, w unused
+};
+
 struct SceneVertex
 {
     float3 position : POSITION;
@@ -98,6 +108,122 @@ GeometryPSOut GeometryPS(GeometryVSOut input)
     }
     output.motion = clamp(previousPixel - input.position.xy, -Viewport.zw, Viewport.zw);
     return output;
+}
+
+// ---------------------------------------------------------------------------
+// Nonrigid scene: dedicated entries.  The mesh is a subdivided local xy grid
+// in [-1,1]; z is an analytic continuous wave evaluated at the current and
+// previous scene times.  Old entries above are intentionally unchanged.
+// ---------------------------------------------------------------------------
+
+float DeformZ(float2 local, float time)
+{
+    float primary = DeformPrimary.x
+        * sin(DeformPrimary.y * local.x + DeformPrimary.w * time)
+        * cos(DeformPrimary.z * local.y + DeformSecondary.x * time);
+    float secondary = DeformSecondary.y
+        * sin(DeformSecondary.z * (local.x + local.y)
+            + DeformSecondary.w * time + DeformTimes.z);
+    return primary + secondary;
+}
+
+float3 DeformNormalLocal(float2 local, float time)
+{
+    float primaryX = cos(DeformPrimary.y * local.x + DeformPrimary.w * time)
+        * cos(DeformPrimary.z * local.y + DeformSecondary.x * time);
+    float primaryY = sin(DeformPrimary.y * local.x + DeformPrimary.w * time)
+        * sin(DeformPrimary.z * local.y + DeformSecondary.x * time);
+    float secondaryWave = cos(DeformSecondary.z * (local.x + local.y)
+        + DeformSecondary.w * time + DeformTimes.z);
+    float dzdx = DeformPrimary.x * DeformPrimary.y * primaryX
+        + DeformSecondary.y * DeformSecondary.z * secondaryWave;
+    float dzdy = -DeformPrimary.x * DeformPrimary.z * primaryY
+        + DeformSecondary.y * DeformSecondary.z * secondaryWave;
+    return normalize(float3(-dzdx, -dzdy, 1.0));
+}
+
+float3 DeformNormalWorld(float2 local, float time)
+{
+    // The world transform is a diagonal scale plus translation, so the normal
+    // transform is the inverse-transpose scale passed in DeformNormalScale.
+    return normalize(DeformNormalLocal(local, time) * DeformNormalScale.xyz);
+}
+
+ColorVSOut DeformColorVS(SceneVertex input)
+{
+    float3 local = float3(input.position.x, input.position.y,
+        DeformZ(input.position.xy, DeformTimes.x));
+    float4 world = mul(float4(local, 1.0), Model);
+
+    ColorVSOut output;
+    output.position = mul(world, ViewProj);
+    output.normal = DeformNormalWorld(input.position.xy, DeformTimes.x);
+    output.worldPosition = world.xyz;
+    output.localPosition = local;
+    return output;
+}
+
+float4 DeformColorPS(ColorVSOut input) : SV_Target
+{
+    float3 normal = normalize(input.normal);
+    float3 lightDirection = normalize(float3(0.35, 0.80, 0.45));
+    float diffuse = saturate(dot(normal, lightDirection));
+    float rim = pow(saturate(1.0 - abs(normal.z)), 2.0) * 0.10;
+    float3 rgb = ObjectColor.rgb * (0.22 + 0.78 * diffuse) + rim;
+    return float4(rgb, 1.0);
+}
+
+GeometryVSOut DeformGeometryVS(SceneVertex input)
+{
+    float3 currentLocal = float3(input.position.x, input.position.y,
+        DeformZ(input.position.xy, DeformTimes.x));
+    float3 previousLocal = float3(input.position.x, input.position.y,
+        DeformZ(input.position.xy, DeformTimes.y));
+    float4 world = mul(float4(currentLocal, 1.0), Model);
+    float4 previousWorld = mul(float4(previousLocal, 1.0), PreviousModel);
+
+    GeometryVSOut output;
+    output.position = mul(world, ViewProj);
+    output.previousClip = mul(previousWorld, PreviousViewProj);
+    return output;
+}
+
+GeometryPSOut DeformGeometryPS(GeometryVSOut input)
+{
+    GeometryPSOut output;
+    output.depth = saturate(input.position.z);
+
+    float2 previousPixel = input.position.xy;
+    if (input.previousClip.w > 0.05)
+    {
+        float2 ndc = input.previousClip.xy / input.previousClip.w;
+        previousPixel = (ndc * float2(0.5, -0.5) + 0.5) * Viewport.zw;
+    }
+    output.motion = clamp(previousPixel - input.position.xy, -Viewport.zw, Viewport.zw);
+    return output;
+}
+
+// ---------------------------------------------------------------------------
+// Transparency scene: dedicated flat-color entries.  ObjectColor is the
+// material rgba (unpremultiplied); the pixel shader returns premultiplied
+// alpha so the transparent PSO can use Src=ONE, Dst=INV_SRC_ALPHA for both
+// RGB and alpha.  Opaque objects carry alpha=1.
+// ---------------------------------------------------------------------------
+
+ColorVSOut FlatColorVS(SceneVertex input)
+{
+    ColorVSOut output;
+    float4 world = mul(float4(input.position, 1.0), Model);
+    output.position = mul(world, ViewProj);
+    output.normal = float3(0.0, 0.0, 1.0);
+    output.worldPosition = world.xyz;
+    output.localPosition = input.position;
+    return output;
+}
+
+float4 FlatColorPS(ColorVSOut input) : SV_Target
+{
+    return float4(ObjectColor.rgb * ObjectColor.a, ObjectColor.a);
 }
 
 struct FullscreenVSOut

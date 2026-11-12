@@ -58,6 +58,63 @@ class MatrixTests(unittest.TestCase):
                 self.assertEqual(matrix.main(), 2)
             self.assertEqual(matrix.combined_status([case, {"status": "run_failed"}]), "run_failed")
 
+    def test_mode1_coverage_aggregates_all_source_pairs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cases = []
+            expected = []
+            for frame in (4, 5):
+                directory = Path(temp) / str(frame)
+                directory.mkdir()
+                rows = [{"source_frame": frame - 1, "measured": False},
+                        {"source_frame": frame, "measured": True}]
+                (directory / "input-check.json").write_text(json.dumps({"frames": rows}))
+                cases.append({"directory": str(directory)})
+                expected.extend(rows)
+            tool = SimpleNamespace(aggregate_coverage=lambda scene, rows: {"status": "pass", "rows": rows})
+            with patch.object(matrix.importlib.util, "module_from_spec", return_value=tool), \
+                    patch.object(matrix.importlib.util, "spec_from_file_location", return_value=SimpleNamespace(
+                        loader=SimpleNamespace(exec_module=lambda module: None))):
+                result = matrix.scene_coverage("screen_cross", cases)
+            self.assertEqual(result["rows"], expected)
+
+    def test_selected_new_scenes_and_coverage_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "matrix"
+            argv = ["run_matrix.py", "--renderer", "renderer.exe", "--xess-bin", "sdk",
+                    "--package", "package", "--out", str(output), "--scenes", "depth_layers", "screen_cross"]
+            case = {"status": "pass", "completed": True, "generated_frames": 8,
+                    "max_frame_rgb_mae": 0, "max_channel_error": 0, "max_over_2_fraction": 0}
+            with patch.object(matrix.sys, "argv", argv), patch.object(matrix, "run_case", return_value=case) as run, \
+                    patch.object(matrix, "scene_coverage", return_value={"status": "fail"}):
+                self.assertEqual(matrix.main(), 3)
+            self.assertEqual(run.call_count, 2)
+            report = json.loads((output / "matrix.json").read_text())
+            self.assertEqual(report["requested_scenes"], ["depth_layers", "screen_cross"])
+            self.assertEqual(report["scenes"][0]["quality_status"], "pass")
+            self.assertEqual(report["scenes"][0]["status"], "coverage_failed")
+
+    def test_new_evidence_scenes_are_opt_in(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "matrix"
+            argv = ["run_matrix.py", "--renderer", "renderer.exe", "--xess-bin", "sdk",
+                    "--package", "package", "--out", str(output),
+                    "--scenes", "nonrigid", "transparency"]
+            case = {"status": "pass", "completed": True, "generated_frames": 8,
+                    "max_frame_rgb_mae": 0, "max_channel_error": 0, "max_over_2_fraction": 0}
+            with patch.object(matrix.sys, "argv", argv), \
+                    patch.object(matrix, "run_case", return_value=case) as run, \
+                    patch.object(matrix, "scene_coverage",
+                                 return_value={"status": "pass"}) as coverage:
+                self.assertEqual(matrix.main(), 0)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(coverage.call_count, 2)
+            report = json.loads((output / "matrix.json").read_text())
+            self.assertEqual(report["requested_scenes"], ["nonrigid", "transparency"])
+            self.assertEqual([row["scene"] for row in report["scenes"]],
+                             ["nonrigid", "transparency"])
+            self.assertNotIn("nonrigid", matrix.SCENES)
+            self.assertNotIn("transparency", matrix.SCENES)
+
     def test_quality_stage_and_mode_are_forwarded(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp) / "scene"
@@ -87,6 +144,28 @@ class MatrixTests(unittest.TestCase):
                 result = matrix.run_case(args, Path(temp) / "scene", "camera", 4)
             self.assertEqual(result["status"], "run_failed")
             self.assertFalse(result["completed"])
+
+    def test_input_coverage_failure_retains_numeric_comparison(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / "scene"
+            args = SimpleNamespace(renderer=Path("renderer.exe"), xess_bin=Path("sdk"), package=Path("package"))
+            def execute(command, **kwargs):
+                if any("check_render_inputs.py" in word for word in command):
+                    directory.mkdir()
+                    (directory / "input-check.json").write_text(json.dumps({"coverage": {"status": "fail"}}))
+                    return SimpleNamespace(returncode=3)
+                if "replay" in command:
+                    (directory / "replay").mkdir()
+                    values = {"rgb_mae": 0, "rgb_max": 0, "over_tolerance_pixel_fraction": 0}
+                    (directory / "replay/report.json").write_text(json.dumps({"pairs": [{"valid_region": values}]}))
+                if any("check_quality.py" in word for word in command):
+                    (directory / "quality.json").write_text(json.dumps({"schema": "xefg.quality_gate/1", "checks": [{"status": "pass"}]}))
+                return SimpleNamespace(returncode=0)
+            with patch.object(matrix.subprocess, "run", side_effect=execute) as run:
+                result = matrix.run_case(args, directory, "depth_layers", 3)
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(run.call_count, 5)
+            self.assertEqual(result["stages"][1]["exit_code"], 3)
 
     def test_native_failure_cannot_be_waived_by_inventory_file(self):
         with tempfile.TemporaryDirectory() as temp:

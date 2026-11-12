@@ -31,8 +31,10 @@ first two complete interpolation frames (76 dispatches).
   for every frame, including warmup. This provenance manifest is distinct from
   the Python examples' sequence manifest.
 
-See [profiles](../../docs/PROFILES.md) for supported sizes and
-[validation](../../docs/VALIDATION.md) for measured results.
+See [profiles](../../docs/PROFILES.md) for supported sizes,
+[validation](../../docs/VALIDATION.md) for test layers, and
+[render results](../render-validation/VALIDATION.md) for measured official
+comparisons.
 
 ## Layout
 

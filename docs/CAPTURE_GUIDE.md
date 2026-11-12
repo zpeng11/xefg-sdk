@@ -128,8 +128,9 @@ For another supported profile, change output dimensions (720p, 1080p, 1440p or
 3840×2160). Larger captures consume substantial memory/disk and are not included
 in the source repository. Keep each mode/size in its own output directory.
 Mode-1 and mode-3 captures exist for all five sizes. Mode-4 captures and
-profiles also exist for all five sizes; SDK outputs match the full
-reconstruction exactly on both frames at every size.
+profiles also exist for all five sizes; the SDK reproduces the project's own
+reconstruction exactly on both frames at every size. Official/provider
+comparisons are bounded, not exact.
 
 ## 3. Export
 
@@ -148,11 +149,12 @@ absent or empty.
 
 Export does not run the provider or call the capture tool automatically. A
 successful export is not a promise of provider byte-exactness or arbitrary-size
-support. Mode-4 profiles exist at all five sizes and match the full research
-reconstruction exactly on both frames. The 640×360 checks use independent
-application images; larger-size checks use application-shaped arrays recovered
-from capture resources. Provider comparisons remain nonzero, so no equality is
-claimed. See [Validation](VALIDATION.md) and [Profiles](PROFILES.md).
+support. Mode-4 profiles exist at all five sizes and match the project's own
+research reconstruction exactly on both frames. The 640×360 checks use
+independent application images; larger-size checks use application-shaped arrays
+recovered from capture resources. Provider comparisons remain nonzero and are
+bounded by the documented `d25` residual, so no equality is claimed. See
+[Validation](VALIDATION.md) and [Profiles](PROFILES.md).
 
 ## 4. Runtime
 

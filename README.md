@@ -5,7 +5,7 @@ XeFG 2x pipeline. This is an independent research SDK, not Intel's official XeSS
 SDK and not a swapchain integration.
 
 - **Capture (optional, Windows):** user-provided XeFG SDK → retained trace and tensors.
-- **Exporter:** retained captures → ONNX models + manifest + resolution profiles.
+- **Exporter:** compatible captures → ONNX models + manifest + resolution profiles.
 - **Runtime:** normalized application images + model package → generated frame.
 - **Executor:** a small injectable interface; ONNX Runtime is an optional reference
   implementation. No vendor-specific NPU/GPU backend is implemented here.
@@ -145,9 +145,14 @@ Synthetic unit tests and the small real-ORT smoke test need no captures.
 Capture integration tests are opt-in, with no machine-specific dataset defaults.
 See [development](docs/DEVELOPMENT.md) for fixture paths and native-tool tests.
 The independent [render-validation tool](tools/render-validation/README.md)
-captures official presents, verifies calibration frame pairing and compares
-same-input SDK replay against official output. Its independent DX12 renderer
-also covers indexed geometry, occlusion, camera motion and history resets.
+captures official presents, verifies frame pairing, and compares same-input SDK
+replay against official output. Its DX12 renderer covers nine scenes: rigid and
+nonrigid motion, layered depth, transparent content, occlusion, camera movement,
+and history resets. The supported matrix is 135 mode/size/scene combinations and
+1065 generated frames. Measured outcomes and gates are in
+[render validation](tools/render-validation/VALIDATION.md). Validation artifacts
+and model packages are kept outside the source checkout; they are not runtime
+dependencies or part of the Python package.
 
 ```text
 src/xefg_sdk/          public runtime API, package loader, planner, executors

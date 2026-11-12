@@ -135,8 +135,11 @@ def _sample_graph(b, tag, tex, pos_x, pos_y):
     b.add("Add", [tag + "_s01", taps[2]], [tag + "_s012"])
     b.add("Add", [tag + "_s012", taps[3]], [tag + "_total"])
     b.add("Cast", [tag + "_total"], [tag + "_total_d"], to=TensorProto.DOUBLE)
-    b.const(tag + "_denom", "fp64", [65536.0])
-    b.add("Div", [tag + "_total_d", tag + "_denom"], [tag + "_out"])
+    b.const(tag + "_round_divisor", "fp64", [8.0])
+    b.add("Div", [tag + "_total_d", tag + "_round_divisor"], [tag + "_grid_units"])
+    b.add("Round", [tag + "_grid_units"], [tag + "_rounded_units"])
+    b.const(tag + "_denom", "fp64", [8192.0])
+    b.add("Div", [tag + "_rounded_units", tag + "_denom"], [tag + "_out"])
     return tag + "_out"
 
 

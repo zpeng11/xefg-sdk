@@ -1123,12 +1123,11 @@ def _warp_init_sample_graph(builder, plan, tag, tex, pos_x, pos_y):
     """Bilinear four-tap of a BGRA8 texture, exactly as the replay.
 
     `tex` is a [height*width, 4] RGBA uint8 tensor. This mirrors the sampler
-    model `recon._warp_init_sample` uses (`uv32exact` in trace/fit_coords.py):
-    a float32 uv (`pos * float32(1 / size)`), an exact float64 `uv * size - 0.5`
-    texel coordinate, and 8-bit subtexel weights that are ONNX `Round`
-    (half-to-even) on `frac * 256`, clipped to 0..256. The four products are
-    summed in int32 and divided once by 65536, so the graph and the reference
-    kernel produce identical float64 units.
+    model `recon._warp_init_sample` uses: a float32 uv (`pos * float32(1 / size)`),
+    an exact float64 `uv * size - 0.5` texel coordinate, and 8-bit subtexel
+    weights rounded half-to-even on `frac * 256`, clipped to 0..256. The int32
+    four-tap sum is rounded half-to-even from 16 to 13 fractional bits, so the
+    graph and reference produce identical float64 byte units.
     """
     b = builder
     height, width = plan["oh"], plan["ow"]
@@ -1204,8 +1203,11 @@ def _warp_init_sample_graph(builder, plan, tag, tex, pos_x, pos_y):
     b.add("Add", [tag + "_s01", taps[2]], [tag + "_s012"])
     b.add("Add", [tag + "_s012", taps[3]], [tag + "_total"])
     b.add("Cast", [tag + "_total"], [tag + "_total_d"], to=TensorProto.DOUBLE)
-    b.const(tag + "_denom", "fp64", [65536.0])
-    b.add("Div", [tag + "_total_d", tag + "_denom"], [tag + "_out"])
+    b.const(tag + "_round_divisor", "fp64", [8.0])
+    b.add("Div", [tag + "_total_d", tag + "_round_divisor"], [tag + "_grid_units"])
+    b.add("Round", [tag + "_grid_units"], [tag + "_rounded_units"])
+    b.const(tag + "_denom", "fp64", [8192.0])
+    b.add("Div", [tag + "_rounded_units", tag + "_denom"], [tag + "_out"])
     return tag + "_out"
 
 

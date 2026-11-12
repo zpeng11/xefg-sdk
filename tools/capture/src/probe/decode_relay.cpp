@@ -97,7 +97,10 @@ bool DecodeRelay::Install(HMODULE fgModule, TraceWriter& writer, const std::file
             return false;
         }
         const auto& layout = xess_layout::Get(fgModule, true);
-        if (layout.family != "fg78")
+        // layout.family is a const char* into the generated family table.
+        // Compare contents, not pointers: Debug builds do not pool identical
+        // literals the way the Release-built probe did.
+        if (!layout.family || std::strcmp(layout.family, "fg78") != 0)
         {
             error = std::string("unsupported libxess_fg family '") + layout.family
                 + "' (the probe is calibrated for fg78)";

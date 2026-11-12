@@ -246,10 +246,13 @@ guess a nearby profile or resample to an arbitrary resolution.
 Profile metadata is imported from the exporter. Formula-generated profiles are
 future work. Version 0.3.0 supports the known profiles present in the package
 and makes no arbitrary-resolution claim. Mode-4 profiles exist at all five sizes
-through 4K and are included in the 15-profile package. SDK outputs match the full
-reconstruction exactly on both frames at every size; 640×360 used independent
-application images, and larger sizes used application-shaped arrays recovered
-from capture resources.
+through 4K and are included in the 15-profile package. The exported ONNX graph
+and SDK runtime reproduce the project's own research reconstruction exactly on
+the inspected frames at every size; 640×360 used independent application images,
+and larger sizes used application-shaped arrays recovered from capture resources.
+That exactness is against the project's reconstruction, not the provider:
+official comparisons are bounded, with the `d25` residual defined in
+[Compatibility §5.4](COMPATIBILITY.md#54-d25-sampling-precision).
 
 ## 5. Final output and optional debug outputs
 

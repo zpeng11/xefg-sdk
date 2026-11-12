@@ -171,6 +171,17 @@ struct SceneObjectRecord
     std::string name;
     std::array<float, 16> world{};
     std::array<float, 16> previousWorld{};
+    // Optional material contract for the opt-in scenes.  hasMaterial stays
+    // false for the original scenes so their manifest bytes are unchanged.
+    bool hasMaterial = false;
+    std::string role;
+    std::string mesh;
+    std::array<float, 4> flatColor{};
+    std::array<float, 4> premultipliedColor{};
+    bool transparent = false;
+    bool depthWrite = true;
+    bool writesDepthMotion = true;
+    int32_t sortIndex = 0;
 };
 
 struct SceneFrameRecord
@@ -185,6 +196,10 @@ struct SceneFrameRecord
     std::string midpoint;
     float time = 0.0f;
     float previousTime = 0.0f;
+    // Opt-in nonrigid frames record the exact deformation state.  The formula
+    // constants live in SceneManifest::sceneExtensionJson.
+    bool hasDeformation = false;
+    bool previousIsCurrent = false;
 
     // depth, motion, color, ui, constants, present_id.  Empty means the public
     // submission was not performed (for example UI in modes 1 and 4, or every
@@ -213,6 +228,9 @@ struct SceneManifest
     std::string shaderSource;
     std::string shaderSha256;
     std::string rendererVersion;
+    // Complete JSON object emitted as "scene_extension".  Empty for scenes
+    // that do not need the optional material/deformation contract.
+    std::string sceneExtensionJson;
     std::vector<SceneFrameRecord> frames;
 };
 
@@ -225,6 +243,12 @@ inline void WriteFloatArray(std::ostream& stream, const std::array<float, 16>& v
         stream << JsonFloat(values[i]);
     }
     stream << ']';
+}
+
+inline void WriteFloatArray4(std::ostream& stream, const std::array<float, 4>& values)
+{
+    stream << '[' << JsonFloat(values[0]) << ", " << JsonFloat(values[1]) << ", "
+           << JsonFloat(values[2]) << ", " << JsonFloat(values[3]) << ']';
 }
 
 inline bool WriteSceneManifest(const std::filesystem::path& path, const SceneManifest& manifest,
@@ -275,6 +299,8 @@ inline bool WriteSceneManifest(const std::filesystem::path& path, const SceneMan
     file << "  \"renderer\": {\"version\": \"" << JsonEscape(manifest.rendererVersion)
          << "\", \"shader_source\": \"" << JsonEscape(manifest.shaderSource)
          << "\", \"shader_sha256\": \"" << manifest.shaderSha256 << "\"},\n";
+    if (!manifest.sceneExtensionJson.empty())
+        file << "  \"scene_extension\": " << manifest.sceneExtensionJson << ",\n";
     file << "  \"frames\": [\n";
     for (size_t i = 0; i < manifest.frames.size(); ++i)
     {
@@ -287,6 +313,13 @@ inline bool WriteSceneManifest(const std::filesystem::path& path, const SceneMan
         file << ", \"midpoint\": \"" << JsonEscape(frame.midpoint) << "\"";
         file << ", \"time\": " << JsonFloat(frame.time)
              << ", \"previous_time\": " << JsonFloat(frame.previousTime);
+        if (frame.hasDeformation)
+        {
+            file << ", \"deformation\": {\"time\": " << JsonFloat(frame.time)
+                 << ", \"previous_time\": " << JsonFloat(frame.previousTime)
+                 << ", \"previous_is_current\": "
+                 << (frame.previousIsCurrent ? "true" : "false") << "}";
+        }
         file << ", \"submission_results\": {";
         static constexpr const char* names[6] = {
             "depth", "motion", "color", "ui", "constants", "present_id"};
@@ -313,6 +346,20 @@ inline bool WriteSceneManifest(const std::filesystem::path& path, const SceneMan
             WriteFloatArray(file, object.world);
             file << ", \"previous_world\": ";
             WriteFloatArray(file, object.previousWorld);
+            if (object.hasMaterial)
+            {
+                file << ", \"role\": \"" << JsonEscape(object.role)
+                     << "\", \"mesh\": \"" << JsonEscape(object.mesh)
+                     << "\", \"flat_color_rgba\": ";
+                WriteFloatArray4(file, object.flatColor);
+                file << ", \"premultiplied_rgba\": ";
+                WriteFloatArray4(file, object.premultipliedColor);
+                file << ", \"transparent\": " << (object.transparent ? "true" : "false")
+                     << ", \"depth_write\": " << (object.depthWrite ? "true" : "false")
+                     << ", \"writes_depth_motion\": "
+                     << (object.writesDepthMotion ? "true" : "false")
+                     << ", \"sort_index\": " << object.sortIndex;
+            }
             file << "}";
         }
         file << "]";

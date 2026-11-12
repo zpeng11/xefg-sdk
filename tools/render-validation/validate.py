@@ -174,6 +174,9 @@ def render_capture(args):
         command += ["--pair-frame", str(args.pair_frame)]
     if args.xess_bin:
         command += ["--xess-dir", str(args.xess_bin.resolve())]
+    if getattr(args, "tensor_frame", None) is not None:
+        command += ["--tensor-frame", str(args.tensor_frame),
+                    "--tensor-budget-mb", str(args.tensor_budget_mb)]
     for flag in ("render_only", "warp", "debug", "no_tag"):
         if getattr(args, flag):
             command.append("--" + flag.replace("_", "-"))
@@ -227,17 +230,25 @@ def main():
     render.add_argument("--renderer", type=Path, required=True)
     render.add_argument("--xess-bin", type=Path)
     render.add_argument("--out", type=Path, required=True)
-    render.add_argument("--scene", choices=("translation", "occlusion", "camera", "cut"), default="translation")
+    render.add_argument("--scene", choices=("translation", "occlusion", "camera", "cut",
+                                           "depth_layers", "screen_cross", "camera_turn",
+                                           "nonrigid", "transparency"), default="translation")
     render.add_argument("--mode", type=int, choices=(1, 3, 4), default=3)
     render.add_argument("--size", choices=("640x360", "1280x720", "1920x1080", "2560x1440", "3840x2160"),
                         default="640x360")
     render.add_argument("--pair-frame", type=int, help="Mode 1 isolated source pair ending at this scene frame")
     render.add_argument("--frames", type=int, default=8)
+    render.add_argument("--tensor-frame", type=int,
+                        help="Snapshot one frame using a diagnostic-enabled renderer")
+    render.add_argument("--tensor-budget-mb", type=int, default=1024)
     render.add_argument("--pacing-ms", type=int, default=16)
     for flag in ("render-only", "warp", "debug", "no-tag"):
         render.add_argument("--" + flag, action="store_true")
     args = parser.parse_args()
     if args.command == "render":
+        if args.tensor_frame is not None and (args.render_only or args.pair_frame is not None
+                or not 0 <= args.tensor_frame < args.frames + 4 or args.tensor_budget_mb <= 0):
+            parser.error("--tensor-frame requires a sequential FG run, an in-range frame and positive budget")
         if not 1 <= args.frames <= 65532 or args.pacing_ms < 0:
             parser.error("render requires 1..65532 measured frames and nonnegative pacing")
         if args.pair_frame is not None and (args.mode != 1 or not 1 <= args.pair_frame <= 65535

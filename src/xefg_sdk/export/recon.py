@@ -2640,13 +2640,11 @@ def reconstruct_warp(run_dir, dispatch):
 
 # ---- warp + flow init (d25) -------------------------------------------------
 # The only operator that samples the scene through the texture unit's bilinear
-# filter. The sampler model is `uv32exact` (trace/fit_coords.py): float32
-# `pos * float32(1/size)`, an exact float64 `uv * size - 0.5` texel coordinate,
-# and half-to-even 8-bit subtexel weights. The replay reproduces the fixed-point
-# sum and leaves the last bit of the filter free. Measured residual falls from
-# 924/1094/1853/1436 to 647/791/1010/790 bytes (640/720/1080/1440) at +-1 LSB,
-# almost entirely on the two warped colour pulls. The bound itself lives in
-# `d25_bound.py`, shared with every other gate.
+# filter. Float32 UVs and half-to-even 8-bit subtexel weights feed an integer
+# four-tap sum. The measured fg78/RX6800XT sampler rounds that sum to 13
+# fractional bits in byte units before feature quantisation. The current
+# measured evidence is summarized in tools/render-validation/VALIDATION.md; the
+# per-size colour-store bound lives in `d25_bound.py`.
 WARP_INIT_MAX_DIFF = d25_bound.WARP_INIT_MAX_DIFF
 WARP_INIT_MAX_FRACTION = d25_bound.WARP_INIT_MAX_FRACTION
 
@@ -2680,14 +2678,15 @@ def _warp_init_sample(tex, pos_x, pos_y):
     """Bilinear sample of a BGRA8 texture, in shader order and 0..255 units.
 
     The sampler is MIN_MAG_MIP_LINEAR with clamp addressing. This is the
-    texture-unit model the sampler probe established (`uv32exact` in
-    trace/fit_coords.py): the shader normalises the pixel position with a
+    texture-unit model measured by the hardware sampler probe: the shader
+    normalises the pixel position with a
     float32 reciprocal (`uv = float32(pos * float32(1 / size))`) and the texture
     unit multiplies that float32 uv by the size as an exact float64 product
     before the usual float64 `- 0.5` texel shift. The 8-bit subtexel weights are
     round-half-to-even (`np.rint`) on `frac * 256`, clipped to 0..256, and the
-    four fixed-point products are summed before one rounding, so the result is
-    reproduced as an integer sum rather than float filtering.
+    four fixed-point products are summed, then rounded half-to-even from 16
+    to 13 fractional bits. Returning exact byte units preserves the measured
+    feature truncation; it does not claim bit-exact sampler float conversion.
     """
     h, w = tex.shape[:2]
     uv_x = (pos_x.astype(np.float32)
@@ -2709,7 +2708,7 @@ def _warp_init_sample(tex, pos_x, pos_y):
              + src[y0i, x1i] * ((256 - iy) * ix)[..., None]
              + src[y1i, x0i] * (iy * (256 - ix))[..., None]
              + src[y1i, x1i] * (iy * ix)[..., None])
-    return total.astype(np.float64) / 65536.0
+    return np.rint(total.astype(np.float64) / 8.0) / 8192.0
 
 
 def _warp_init_curve(units):

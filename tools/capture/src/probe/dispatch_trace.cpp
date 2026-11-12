@@ -598,6 +598,16 @@ uint64_t DispatchTrace::TensorBytes() const
     return tensors_ ? tensors_->Bytes() : 0;
 }
 
+bool DispatchTrace::TensorEnabled() const
+{
+    return tensors_ && tensors_->Enabled();
+}
+
+uint64_t DispatchTrace::TensorBudgetBytes() const
+{
+    return uint64_t(options_.tensorBudgetMB ? options_.tensorBudgetMB : 512) << 20;
+}
+
 uint64_t DispatchTrace::DispatchCount() const { return dispatches_.load(); }
 
 size_t DispatchTrace::DistinctPrograms() const
@@ -938,6 +948,7 @@ void DispatchTrace::Dispatch(ID3D12GraphicsCommandList* list, UINT x, UINT y, UI
     }
 
     const bool snapshots = tensors_ && tensors_->Enabled()
+        && TensorFrameSelected(options_, frame)
         && (options_.tensorDispatches == 0 || id <= options_.tensorDispatches);
     if (snapshots)
     {

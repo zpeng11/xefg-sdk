@@ -278,7 +278,7 @@ model boundary, not raw engine metadata.
 Depth detail: the captured fg78 graph derives its own depth key internally as
 `clip(trunc((1 - d) * 32767), 0, 32767) << 16`, and the `d25` missing-splat
 fallback uses `d - 1000`. Those are graph behaviours after the model boundary,
-not core input transformations. The retained capture scene contains only depth
+not core input transformations. The analytical probe scene contains only depth
 values `1.0` and `100.0`, so this SDK does not claim that the full standard
 device-depth range has been proven.
 
@@ -349,9 +349,13 @@ The SDK raises `ValueError` for:
 Supported profiles are fixed data in the model package. Version 0.3.0 makes no
 arbitrary-resolution claim; a frame sequence must match a profile shipped with
 the package. Mode-4 profiles exist at all five sizes and are included in the
-15-profile package. SDK outputs match the full reconstruction exactly on both
-frames at every size; 640×360 used independent application images, and larger
-sizes used application-shaped arrays recovered from capture resources.
+15-profile package. The exported ONNX graph and SDK runtime reproduce the
+project's own research reconstruction exactly on the inspected frames at every
+size; 640×360 used independent application images, and larger sizes used
+application-shaped arrays recovered from capture resources. That exactness is
+against the project's reconstruction, not the provider: official comparisons are
+bounded, with the `d25` residual defined in
+[Compatibility §5.4](COMPATIBILITY.md#54-d25-sampling-precision).
 
 ## 10. Non-goals
 

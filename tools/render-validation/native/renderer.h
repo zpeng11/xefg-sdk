@@ -58,9 +58,15 @@ enum class SceneKind : uint32_t
     Occlusion = 1,
     Camera = 2,
     Cut = 3,
+    DepthLayers = 4,
+    ScreenCross = 5,
+    CameraTurn = 6,
+    // Opt-in scenes.  Appended so the original scene numbers stay stable.
+    Nonrigid = 7,
+    Transparency = 8,
 };
 
-constexpr size_t kSceneCount = 4;
+constexpr size_t kSceneCount = 9;
 extern const char* const kSceneNames[kSceneCount];
 
 bool IsKnownScene(const std::string& scene);
@@ -90,18 +96,58 @@ enum class MeshKind : uint32_t
     Cube = 0,
     Ground = 1,
     Rod = 2,
+    // Subdivided xy grid used by the nonrigid scene.  Its shader entry
+    // displaces local z with the analytic wave in Nonrigid* below.
+    Grid = 3,
+    // Flat quad [-1,1]^2 used by the transparency scene and drawn with the
+    // dedicated flat-color entry (no lighting or checker).
+    Panel = 4,
 };
+
+const char* MeshName(MeshKind mesh);
 
 struct ObjectState
 {
     std::string name;
+    std::string role;
     MeshKind mesh = MeshKind::Cube;
     Matrix4 world = IdentityMatrix();
     Matrix4 previousWorld = IdentityMatrix();
     float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    // Transparent objects are drawn after opaque ones, back to front, with
+    // premultiplied-alpha blending, depth test on and depth write off.  They
+    // never contribute to the half-resolution depth/motion pass.
+    bool transparent = false;
+    bool depthWrite = true;
+    bool writesDepthMotion = true;
+    int32_t sortIndex = 0;
 };
 
 constexpr size_t kMaxObjects = 8;
+
+// Nonrigid scene contract.  The same constants are emitted in scene.json and
+// consumed by the dedicated deformation shader entry.  Grid vertices are
+// local (x,y) in [-1,1] with index = iy * (cells + 1) + ix; world positions
+// are p = (scaleX * x, scaleY * y, z(x,y,t) + translateZ).
+constexpr uint32_t kNonrigidGridCells = 64;
+constexpr uint32_t kNonrigidGridVertices = kNonrigidGridCells + 1;
+constexpr float kNonrigidScaleX = 2.7f;
+constexpr float kNonrigidScaleY = 1.5f;
+constexpr float kNonrigidTranslateZ = -4.2f;
+constexpr float kNonrigidPrimaryAmplitude = 0.34f;
+constexpr float kNonrigidPrimaryKx = 2.1f;
+constexpr float kNonrigidPrimaryKy = 1.6f;
+constexpr float kNonrigidPrimaryOmegaX = 1.20f;
+constexpr float kNonrigidPrimaryOmegaY = 0.75f;
+constexpr float kNonrigidSecondaryAmplitude = 0.10f;
+constexpr float kNonrigidSecondaryK = 1.3f;
+constexpr float kNonrigidSecondaryOmega = 0.90f;
+constexpr float kNonrigidSecondaryPhase = 0.40f;
+
+float NonrigidDisplacement(float localX, float localY, float time);
+void NonrigidNormalLocal(float localX, float localY, float time, float out[3]);
+// Analytic world position for one local grid coordinate at a given scene time.
+void NonrigidWorldPosition(float localX, float localY, float time, float out[3]);
 
 struct FrameState
 {

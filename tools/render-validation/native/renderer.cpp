@@ -63,8 +63,17 @@ struct GpuFrameConstants
     float frameData[4];
 };
 
+struct GpuDeformConstants
+{
+    float primary[4];   // A1, kx, ky, w1
+    float secondary[4]; // w2, A2, k2, w3
+    float times[4];     // current time, previous time, phase2, flags
+    float normalScale[4]; // inverse world scale xyz, unused
+};
+
 static_assert(sizeof(GpuObjectConstants) == 160, "object constants must be 40 dwords");
 static_assert(sizeof(GpuFrameConstants) == 160, "frame constants must be 40 dwords");
+static_assert(sizeof(GpuDeformConstants) == 64, "deform constants must be 16 dwords");
 
 Matrix4 Mat(float m00, float m01, float m02, float m03,
             float m10, float m11, float m12, float m13,
@@ -109,6 +118,53 @@ void AppendBox(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
 
     range.indexCount = static_cast<UINT>(indices.size()) - range.indexOffset;
     (void)base;
+}
+
+// Flat local quad [-1,1]^2 at z=0.  Panel PSOs use cull-none, so the winding
+// only needs to be consistent for the CPU reconstruction contract.
+void AppendPanel(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices, MeshRange& range)
+{
+    range.indexOffset = static_cast<UINT>(indices.size());
+    const uint32_t base = static_cast<uint32_t>(vertices.size());
+    vertices.push_back({{-1.0f, -1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}});
+    vertices.push_back({{ 1.0f, -1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}});
+    vertices.push_back({{-1.0f,  1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}});
+    vertices.push_back({{ 1.0f,  1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}});
+    indices.push_back(base + 0); indices.push_back(base + 1); indices.push_back(base + 3);
+    indices.push_back(base + 0); indices.push_back(base + 3); indices.push_back(base + 2);
+    range.indexCount = 6;
+}
+
+// Subdivided xy grid in [-1,1]; input z/normal are placeholders because the
+// dedicated deformation entry evaluates both from the analytic wave.
+void AppendGrid(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
+    uint32_t cells, MeshRange& range)
+{
+    range.indexOffset = static_cast<UINT>(indices.size());
+    const uint32_t base = static_cast<uint32_t>(vertices.size());
+    const uint32_t stride = cells + 1;
+    for (uint32_t iy = 0; iy < stride; ++iy)
+    {
+        const float y = -1.0f + 2.0f * static_cast<float>(iy) / static_cast<float>(cells);
+        for (uint32_t ix = 0; ix < stride; ++ix)
+        {
+            const float x = -1.0f + 2.0f * static_cast<float>(ix) / static_cast<float>(cells);
+            vertices.push_back({{x, y, 0.0f}, {0.0f, 0.0f, 1.0f}});
+        }
+    }
+    for (uint32_t iy = 0; iy < cells; ++iy)
+    {
+        for (uint32_t ix = 0; ix < cells; ++ix)
+        {
+            const uint32_t a = base + iy * stride + ix;
+            const uint32_t b = a + 1;
+            const uint32_t c = a + stride;
+            const uint32_t d = c + 1;
+            indices.push_back(a); indices.push_back(b); indices.push_back(d);
+            indices.push_back(a); indices.push_back(d); indices.push_back(c);
+        }
+    }
+    range.indexCount = static_cast<UINT>(indices.size()) - range.indexOffset;
 }
 
 struct CameraPose
@@ -263,7 +319,22 @@ UINT BytesPerPixel(DXGI_FORMAT format)
 
 const char* const kSceneNames[kSceneCount] = {
     "translation", "occlusion", "camera", "cut",
+    "depth_layers", "screen_cross", "camera_turn",
+    "nonrigid", "transparency",
 };
+
+const char* MeshName(MeshKind mesh)
+{
+    switch (mesh)
+    {
+    case MeshKind::Cube: return "cube";
+    case MeshKind::Ground: return "ground";
+    case MeshKind::Rod: return "rod";
+    case MeshKind::Grid: return "grid";
+    case MeshKind::Panel: return "panel";
+    }
+    return "unknown";
+}
 
 bool IsKnownScene(const std::string& scene)
 {
@@ -384,6 +455,324 @@ Matrix4 MakePerspective(float fovYRadians, float aspect, float nearZ, float farZ
         0.0f, 0.0f, -(farZ * nearZ) / (farZ - nearZ), 0.0f);
 }
 
+float NonrigidDisplacement(float localX, float localY, float time)
+{
+    const float primary = kNonrigidPrimaryAmplitude
+        * std::sin(kNonrigidPrimaryKx * localX + kNonrigidPrimaryOmegaX * time)
+        * std::cos(kNonrigidPrimaryKy * localY + kNonrigidPrimaryOmegaY * time);
+    const float secondary = kNonrigidSecondaryAmplitude
+        * std::sin(kNonrigidSecondaryK * (localX + localY)
+            + kNonrigidSecondaryOmega * time + kNonrigidSecondaryPhase);
+    return primary + secondary;
+}
+
+void NonrigidNormalLocal(float localX, float localY, float time, float out[3])
+{
+    const float primaryX = std::cos(kNonrigidPrimaryKx * localX
+        + kNonrigidPrimaryOmegaX * time)
+        * std::cos(kNonrigidPrimaryKy * localY + kNonrigidPrimaryOmegaY * time);
+    const float primaryY = std::sin(kNonrigidPrimaryKx * localX
+        + kNonrigidPrimaryOmegaX * time)
+        * std::sin(kNonrigidPrimaryKy * localY + kNonrigidPrimaryOmegaY * time);
+    const float secondaryWave = std::cos(kNonrigidSecondaryK * (localX + localY)
+        + kNonrigidSecondaryOmega * time + kNonrigidSecondaryPhase);
+    const float dzdx = kNonrigidPrimaryAmplitude * kNonrigidPrimaryKx * primaryX
+        + kNonrigidSecondaryAmplitude * kNonrigidSecondaryK * secondaryWave;
+    const float dzdy = -kNonrigidPrimaryAmplitude * kNonrigidPrimaryKy * primaryY
+        + kNonrigidSecondaryAmplitude * kNonrigidSecondaryK * secondaryWave;
+    const float length = std::sqrt(dzdx * dzdx + dzdy * dzdy + 1.0f);
+    out[0] = -dzdx / length;
+    out[1] = -dzdy / length;
+    out[2] = 1.0f / length;
+}
+
+void NonrigidWorldPosition(float localX, float localY, float time, float out[3])
+{
+    out[0] = kNonrigidScaleX * localX;
+    out[1] = kNonrigidScaleY * localY;
+    out[2] = NonrigidDisplacement(localX, localY, time) + kNonrigidTranslateZ;
+}
+
+namespace
+{
+// Continuous triangle wave in [-1, 1] with linear segments and exact
+// direction reversals.  Used by screen_cross so the horizontal reversal is
+// continuous while the per-frame displacement stays constant.
+float TriangleWave(float time, float period)
+{
+    float phase = time / period;
+    phase -= std::floor(phase);
+    return phase < 0.5f ? 4.0f * phase - 1.0f : 3.0f - 4.0f * phase;
+}
+
+void SetNewSceneCamera(FrameState& state, const float eye[3], const float target[3],
+    const float previousEye[3], const float previousTarget[3])
+{
+    const float up[3] = {0.0f, 1.0f, 0.0f};
+    const float fov = 50.0f * kPi / 180.0f;
+    const float aspect = static_cast<float>(kColorWidth) / static_cast<float>(kColorHeight);
+    state.view = MakeLookAt(eye, target, up);
+    state.projection = MakePerspective(fov, aspect, 0.1f, 100.0f);
+    state.previousView = state.historyReset
+        ? state.view
+        : MakeLookAt(previousEye, previousTarget, up);
+    state.previousProjection = state.projection;
+    state.viewProjection = Multiply(state.view, state.projection);
+    state.previousViewProjection = Multiply(state.previousView, state.previousProjection);
+}
+
+Matrix4 ScaledCubeWorld(float scaleX, float scaleY, float scaleZ,
+    float x, float y, float z)
+{
+    return Multiply(MakeScale(scaleX, scaleY, scaleZ), MakeTranslation(x, y, z));
+}
+
+// Camera at the origin looking down -Z.  Two small cubes sit at 0.30 and 0.45
+// view distance and move in opposite horizontal directions, so their normal-Z
+// depth is below 0.9 with real, non-artificial geometry motion.  A large thin
+// panel at 15 units fills the background at depth above 0.99.
+void BuildDepthLayersState(FrameState& state)
+{
+    const float eye[3] = {0.0f, 0.0f, 0.0f};
+    const float target[3] = {0.0f, 0.0f, -1.0f};
+    SetNewSceneCamera(state, eye, target, eye, target);
+
+    const auto nearX = [](float time) { return std::sin(time * 0.8f); };
+    const float leftX = 0.08f + 0.06f * nearX(state.time);
+    const float rightX = -0.08f - 0.06f * nearX(state.time);
+    const float prevLeftX = 0.08f + 0.06f * nearX(state.previousTime);
+    const float prevRightX = -0.08f - 0.06f * nearX(state.previousTime);
+
+    const Matrix4 left = ScaledCubeWorld(0.09f, 0.09f, 0.09f, leftX, 0.02f, -0.30f);
+    const Matrix4 right = ScaledCubeWorld(0.09f, 0.09f, 0.09f, rightX, -0.03f, -0.45f);
+    const Matrix4 leftPrevious = state.historyReset
+        ? left : ScaledCubeWorld(0.09f, 0.09f, 0.09f, prevLeftX, 0.02f, -0.30f);
+    const Matrix4 rightPrevious = state.historyReset
+        ? right : ScaledCubeWorld(0.09f, 0.09f, 0.09f, prevRightX, -0.03f, -0.45f);
+
+    const float leftColor[4] = {0.95f, 0.38f, 0.16f, 1.0f};
+    const float rightColor[4] = {0.95f, 0.84f, 0.22f, 1.0f};
+    const float farColor[4] = {0.18f, 0.34f, 0.66f, 1.0f};
+    AddObject(state, "near_left", MeshKind::Cube, left, leftPrevious, leftColor);
+    AddObject(state, "near_right", MeshKind::Cube, right, rightPrevious, rightColor);
+
+    // Static mid cube, offset down/right so it does not hide the near cubes or
+    // the far panel; normal-Z is about 0.96 (mid band).
+    const float midColor[4] = {0.42f, 0.80f, 0.50f, 1.0f};
+    const Matrix4 midCube = ScaledCubeWorld(0.4f, 0.4f, 0.4f, 0.7f, -0.3f, -2.5f);
+    AddObject(state, "mid_cube", MeshKind::Cube, midCube, midCube, midColor);
+
+    // Static far panel, front face at about 14.8 units (normal-Z ~0.994).
+    const Matrix4 farPanel = ScaledCubeWorld(18.0f, 11.0f, 0.4f, 0.0f, 0.0f, -15.0f);
+    AddObject(state, "far_panel", MeshKind::Cube, farPanel, farPanel, farColor);
+}
+
+// Fixed camera.  Two cubes at different depths follow a continuous
+// triangle-wave horizontal reversal plus sinusoidal depth and vertical motion
+// (periods 12, 9 and 7), including midpoint time.  The near cube sweeps to the
+// screen edge while the far cube crosses the other way.
+void BuildScreenCrossState(FrameState& state)
+{
+    const float eye[3] = {0.0f, 0.0f, 0.0f};
+    const float target[3] = {0.0f, 0.0f, -1.0f};
+    SetNewSceneCamera(state, eye, target, eye, target);
+
+    const auto pose = [](float time, float& nearX, float& nearY, float& nearZ,
+                         float& farX, float& farY, float& farZ) {
+        // Period 10 puts the near object at the right edge on frame 5 and the
+        // left edge on frame 10, so both exits fall inside frames 4..11.
+        const float triangle = TriangleWave(time, 10.0f);
+        nearX = 1.1f * triangle;
+        nearY = 0.12f * std::sin(time * 0.8975979f + 0.4f);
+        // Depth reaches its closest point on those same two extrema.
+        nearZ = -(1.7f - 0.26f * std::cos(time * 1.2566371f));
+        farX = -1.8f * triangle;
+        farY = 0.25f * std::sin(time * 0.8975979f + 1.3f);
+        farZ = -(5.0f + 1.2f * std::sin(time * 0.6981317f + 1.0f));
+    };
+
+    float nearX = 0.0f, nearY = 0.0f, nearZ = 0.0f;
+    float farX = 0.0f, farY = 0.0f, farZ = 0.0f;
+    float prevNearX = 0.0f, prevNearY = 0.0f, prevNearZ = 0.0f;
+    float prevFarX = 0.0f, prevFarY = 0.0f, prevFarZ = 0.0f;
+    pose(state.time, nearX, nearY, nearZ, farX, farY, farZ);
+    if (state.historyReset) { prevNearX = nearX; prevNearY = nearY; prevNearZ = nearZ;
+        prevFarX = farX; prevFarY = farY; prevFarZ = farZ; }
+    else pose(state.previousTime, prevNearX, prevNearY, prevNearZ,
+        prevFarX, prevFarY, prevFarZ);
+
+    const Matrix4 nearWorld = ScaledCubeWorld(0.30f, 0.30f, 0.30f, nearX, nearY, nearZ);
+    const Matrix4 farWorld = ScaledCubeWorld(1.0f, 1.0f, 1.0f, farX, farY, farZ);
+    const Matrix4 nearPrevious = ScaledCubeWorld(
+        0.30f, 0.30f, 0.30f, prevNearX, prevNearY, prevNearZ);
+    const Matrix4 farPrevious = ScaledCubeWorld(
+        1.0f, 1.0f, 1.0f, prevFarX, prevFarY, prevFarZ);
+
+    const float nearColor[4] = {0.90f, 0.28f, 0.22f, 1.0f};
+    const float farColor[4] = {0.20f, 0.75f, 0.80f, 1.0f};
+    const float backdropColor[4] = {0.15f, 0.22f, 0.34f, 1.0f};
+    AddObject(state, "cross_near", MeshKind::Cube, nearWorld, nearPrevious, nearColor);
+    AddObject(state, "cross_far", MeshKind::Cube, farWorld, farPrevious, farColor);
+
+    // Static backdrop at 22 units (normal-Z ~0.996) keeps a non-moving
+    // background across the whole screen when the two cubes leave the edges.
+    const Matrix4 backdrop = ScaledCubeWorld(38.0f, 20.0f, 0.5f, 0.0f, 0.0f, -22.0f);
+    AddObject(state, "cross_backdrop", MeshKind::Cube, backdrop, backdrop, backdropColor);
+}
+
+// Static near/mid/far geometry seen by a camera with continuous yaw sway and a
+// larger horizontal translation.  Stored only on the camera, so all objects
+// are static yet every depth moves; near objects move most, giving a clear
+// near/far parallax and a broad motion field from the large far panel.
+void BuildCameraTurnState(FrameState& state)
+{
+    const auto cameraPose = [](float time, float eye[3], float target[3]) {
+        const float yaw = 0.10f * std::sin(0.48f * time);
+        const float tx = 0.75f * std::sin(0.40f * time + 0.30f);
+        const float ty = 0.06f * std::sin(0.31f * time);
+        eye[0] = tx; eye[1] = ty; eye[2] = 0.0f;
+        target[0] = tx + std::sin(yaw);
+        target[1] = ty;
+        target[2] = -std::cos(yaw);
+    };
+
+    float eye[3], target[3], previousEye[3], previousTarget[3];
+    cameraPose(state.time, eye, target);
+    if (state.historyReset)
+    {
+        std::memcpy(previousEye, eye, sizeof(eye));
+        std::memcpy(previousTarget, target, sizeof(target));
+    }
+    else
+    {
+        cameraPose(state.previousTime, previousEye, previousTarget);
+    }
+    SetNewSceneCamera(state, eye, target, previousEye, previousTarget);
+
+    const float nearColor[4] = {0.94f, 0.60f, 0.18f, 1.0f};
+    const float midColor[4] = {0.30f, 0.78f, 0.42f, 1.0f};
+    const float farColor[4] = {0.24f, 0.40f, 0.78f, 1.0f};
+    const Matrix4 nearCube = ScaledCubeWorld(0.6f, 0.6f, 0.6f, -0.8f, 0.0f, -2.2f);
+    const Matrix4 midCube = ScaledCubeWorld(1.0f, 1.0f, 1.0f, 0.9f, 0.15f, -7.0f);
+    const Matrix4 farPanel = ScaledCubeWorld(26.0f, 15.0f, 0.5f, 0.0f, 0.0f, -22.0f);
+    AddObject(state, "turn_near", MeshKind::Cube, nearCube, nearCube, nearColor);
+    AddObject(state, "turn_mid", MeshKind::Cube, midCube, midCube, midColor);
+    AddObject(state, "turn_far", MeshKind::Cube, farPanel, farPanel, farColor);
+}
+
+void AddMaterialObject(FrameState& state, const char* name, const char* role, MeshKind mesh,
+    const Matrix4& world, const Matrix4& previousWorld, const float color[4],
+    bool transparent, bool depthWrite, bool writesDepthMotion, int32_t sortIndex)
+{
+    if (state.objectCount >= kMaxObjects) return;
+    AddObject(state, name, mesh, world, previousWorld, color);
+    ObjectState& object = state.objects[state.objectCount - 1];
+    object.role = role;
+    object.transparent = transparent;
+    object.depthWrite = depthWrite;
+    object.writesDepthMotion = writesDepthMotion;
+    object.sortIndex = sortIndex;
+}
+
+Matrix4 PanelWorld(float scaleX, float scaleY, float x, float y, float z)
+{
+    return Multiply(MakeScale(scaleX, scaleY, 1.0f), MakeTranslation(x, y, z));
+}
+
+// Fixed camera and fixed world transform.  The only motion is the analytic
+// vertex wave evaluated by the dedicated deformation shader entries, so MV at
+// a given pixel comes from the same vertex at the previous scene time.
+void BuildNonrigidState(FrameState& state)
+{
+    const float eye[3] = {0.0f, 0.0f, 0.0f};
+    const float target[3] = {0.0f, 0.0f, -1.0f};
+    SetNewSceneCamera(state, eye, target, eye, target);
+
+    const Matrix4 gridWorld = Multiply(
+        MakeScale(kNonrigidScaleX, kNonrigidScaleY, 1.0f),
+        MakeTranslation(0.0f, 0.0f, kNonrigidTranslateZ));
+    const float gridColor[4] = {0.92f, 0.55f, 0.14f, 1.0f};
+    AddMaterialObject(state, "deform_panel", "deforming_grid", MeshKind::Grid,
+        gridWorld, gridWorld, gridColor, false, true, true, 0);
+
+    // Static opaque background; it keeps depth and a zero-MV reference around
+    // the deforming panel at every frame.
+    const Matrix4 backdrop = ScaledCubeWorld(24.0f, 14.0f, 0.5f, 0.0f, 0.0f, -18.0f);
+    const float backdropColor[4] = {0.12f, 0.18f, 0.28f, 1.0f};
+    AddMaterialObject(state, "static_backdrop", "static_background", MeshKind::Cube,
+        backdrop, backdrop, backdropColor, false, true, true, 1);
+}
+
+// Opaque backdrop and blocker are static.  Two transparent panels move
+// independently; they are drawn back to front into color only.  The opaque
+// depth/motion pass sees backdrop and blocker, so depth/MV stay opaque-only.
+void BuildTransparencyState(FrameState& state)
+{
+    const float eye[3] = {0.0f, 0.0f, 0.0f};
+    const float target[3] = {0.0f, 0.0f, -1.0f};
+    SetNewSceneCamera(state, eye, target, eye, target);
+
+    const auto farPose = [](float time, float& x, float& y) {
+        x = -0.15f + 0.35f * std::sin(0.50f * time);
+        y = -0.30f + 0.10f * std::cos(0.37f * time);
+    };
+    const auto nearPose = [](float time, float& x, float& y) {
+        x = 0.10f + 0.30f * std::sin(0.40f * time + 1.30f);
+        y = 0.35f + 0.08f * std::sin(0.31f * time + 0.60f);
+    };
+
+    float farX = 0.0f, farY = 0.0f, nearX = 0.0f, nearY = 0.0f;
+    float previousFarX = 0.0f, previousFarY = 0.0f;
+    float previousNearX = 0.0f, previousNearY = 0.0f;
+    farPose(state.time, farX, farY);
+    nearPose(state.time, nearX, nearY);
+    if (state.historyReset)
+    {
+        previousFarX = farX; previousFarY = farY;
+        previousNearX = nearX; previousNearY = nearY;
+    }
+    else
+    {
+        farPose(state.previousTime, previousFarX, previousFarY);
+        nearPose(state.previousTime, previousNearX, previousNearY);
+    }
+
+    const float backdropColor[4] = {0.10f, 0.15f, 0.24f, 1.0f};
+    const float blockerColor[4] = {0.20f, 0.24f, 0.26f, 1.0f};
+    const float farColor[4] = {0.80f, 0.22f, 0.18f, 0.55f};
+    const float nearColor[4] = {0.16f, 0.60f, 0.78f, 0.45f};
+
+    const Matrix4 backdrop = PanelWorld(8.0f, 4.5f, 0.0f, 0.0f, -9.0f);
+    const Matrix4 blocker = PanelWorld(0.9f, 0.7f, 1.30f, -0.50f, -2.80f);
+    const Matrix4 farPlane = PanelWorld(2.6f, 1.2f, farX, farY, -5.5f);
+    const Matrix4 farPrevious = PanelWorld(2.6f, 1.2f, previousFarX, previousFarY, -5.5f);
+    const Matrix4 nearPlane = PanelWorld(2.0f, 0.85f, nearX, nearY, -3.8f);
+    const Matrix4 nearPrevious = PanelWorld(2.0f, 0.85f, previousNearX, previousNearY, -3.8f);
+
+    AddMaterialObject(state, "backdrop", "opaque_backdrop", MeshKind::Panel,
+        backdrop, backdrop, backdropColor, false, true, true, 0);
+    AddMaterialObject(state, "blocker", "opaque_blocker", MeshKind::Panel,
+        blocker, blocker, blockerColor, false, true, true, 1);
+    AddMaterialObject(state, "plane_far", "transparent_plane", MeshKind::Panel,
+        farPlane, farPrevious, farColor, true, false, false, 2);
+    AddMaterialObject(state, "plane_near", "transparent_plane", MeshKind::Panel,
+        nearPlane, nearPrevious, nearColor, true, false, false, 3);
+}
+
+void BuildNewSceneState(FrameState& state, SceneKind scene)
+{
+    switch (scene)
+    {
+    case SceneKind::DepthLayers: BuildDepthLayersState(state); break;
+    case SceneKind::ScreenCross: BuildScreenCrossState(state); break;
+    case SceneKind::CameraTurn: BuildCameraTurnState(state); break;
+    case SceneKind::Nonrigid: BuildNonrigidState(state); break;
+    case SceneKind::Transparency: BuildTransparencyState(state); break;
+    default: break;
+    }
+}
+} // namespace
+
 FrameState MakeFrameState(SceneKind scene, uint32_t frame, bool midpoint)
 {
     FrameState state{};
@@ -397,6 +786,16 @@ FrameState MakeFrameState(SceneKind scene, uint32_t frame, bool midpoint)
         ? state.time
         : (midpoint ? static_cast<float>(frame) - 1.0f : state.time - 1.0f);
     state.uiFrameId = frame;
+
+    // New scenes own separate object lists; the four original scenes keep the
+    // existing camera/object path below unchanged.
+    if (scene == SceneKind::DepthLayers || scene == SceneKind::ScreenCross
+        || scene == SceneKind::CameraTurn || scene == SceneKind::Nonrigid
+        || scene == SceneKind::Transparency)
+    {
+        BuildNewSceneState(state, scene);
+        return state;
+    }
 
     const CameraPose current = CameraFor(scene, state.time);
     const CameraPose previous = CameraFor(scene, state.previousTime);
@@ -471,6 +870,11 @@ struct Renderer::Impl
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> colorPipeline;
     ComPtr<ID3D12PipelineState> geometryPipeline;
+    ComPtr<ID3D12PipelineState> deformColorPipeline;
+    ComPtr<ID3D12PipelineState> deformGeometryPipeline;
+    ComPtr<ID3D12PipelineState> flatOpaquePipeline;
+    ComPtr<ID3D12PipelineState> flatTransparentPipeline;
+    ComPtr<ID3D12PipelineState> flatGeometryPipeline;
     ComPtr<ID3D12PipelineState> uiPipeline;
     ComPtr<ID3D12PipelineState> compositePipeline;
 
@@ -490,6 +894,8 @@ struct Renderer::Impl
     MeshRange cubeRange;
     MeshRange groundRange;
     MeshRange rodRange;
+    MeshRange gridRange;
+    MeshRange panelRange;
 
     ComPtr<ID3D12DescriptorHeap> rtvHeap;
     ComPtr<ID3D12DescriptorHeap> dsvHeap;
@@ -666,8 +1072,9 @@ struct Renderer::Impl
 
     bool CreatePipeline(const std::filesystem::path& shaderPath, const char* vsEntry,
         const char* psEntry, const D3D12_INPUT_ELEMENT_DESC* layout, UINT layoutCount,
-        DXGI_FORMAT rtv0, DXGI_FORMAT rtv1, DXGI_FORMAT dsvFormat, bool depth,
-        D3D12_CULL_MODE cull, ComPtr<ID3D12PipelineState>& pipeline, std::string& error)
+        DXGI_FORMAT rtv0, DXGI_FORMAT rtv1, DXGI_FORMAT dsvFormat, bool depthTest,
+        bool depthWrite, bool premultipliedBlend, D3D12_CULL_MODE cull,
+        ComPtr<ID3D12PipelineState>& pipeline, std::string& error)
     {
         ComPtr<ID3DBlob> vertexShader;
         ComPtr<ID3DBlob> pixelShader;
@@ -682,12 +1089,23 @@ struct Renderer::Impl
         description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         if (rtv1 != DXGI_FORMAT_UNKNOWN)
             description.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        if (premultipliedBlend)
+        {
+            D3D12_RENDER_TARGET_BLEND_DESC& blend = description.BlendState.RenderTarget[0];
+            blend.BlendEnable = TRUE;
+            blend.SrcBlend = D3D12_BLEND_ONE;
+            blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            blend.BlendOp = D3D12_BLEND_OP_ADD;
+            blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+            blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        }
         description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         description.RasterizerState.CullMode = cull;
         description.RasterizerState.FrontCounterClockwise = FALSE;
         description.RasterizerState.DepthClipEnable = TRUE;
-        description.DepthStencilState.DepthEnable = depth ? TRUE : FALSE;
-        description.DepthStencilState.DepthWriteMask = depth
+        description.DepthStencilState.DepthEnable = depthTest ? TRUE : FALSE;
+        description.DepthStencilState.DepthWriteMask = depthWrite
             ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
         description.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
         description.DepthStencilState.StencilEnable = FALSE;
@@ -712,7 +1130,7 @@ struct Renderer::Impl
 
     bool CreateRootSignature(std::string& error)
     {
-        D3D12_ROOT_PARAMETER parameters[3]{};
+        D3D12_ROOT_PARAMETER parameters[4]{};
         parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         parameters[0].Constants.ShaderRegister = 0;
         parameters[0].Constants.RegisterSpace = 0;
@@ -720,7 +1138,8 @@ struct Renderer::Impl
         parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         // Frame constants are a root CBV so the root signature stays under
-        // the 64-DWORD limit (object constants 40 + frame CBV 1 + SRV table 1).
+        // the 64-DWORD limit (object constants 40 + deform constants 16 +
+        // two descriptor costs + one SRV table = 59).
         parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         parameters[1].Descriptor.ShaderRegister = 1;
         parameters[1].Descriptor.RegisterSpace = 0;
@@ -738,8 +1157,14 @@ struct Renderer::Impl
         parameters[2].DescriptorTable.pDescriptorRanges = &range;
         parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+        parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameters[3].Constants.ShaderRegister = 2;
+        parameters[3].Constants.RegisterSpace = 0;
+        parameters[3].Constants.Num32BitValues = 16;
+        parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
         D3D12_ROOT_SIGNATURE_DESC description{};
-        description.NumParameters = 3;
+        description.NumParameters = 4;
         description.pParameters = parameters;
         description.NumStaticSamplers = 0;
         description.pStaticSamplers = nullptr;
@@ -771,10 +1196,13 @@ struct Renderer::Impl
     {
         std::vector<Vertex> vertices;
         std::vector<uint32_t> indices;
-        vertices.reserve(72);
-        indices.reserve(108);
+        vertices.reserve(72 + 4 + kNonrigidGridVertices * kNonrigidGridVertices);
+        indices.reserve(108 + 6 + kNonrigidGridCells * kNonrigidGridCells * 6);
         AppendBox(vertices, indices, 0.5f, 0.5f, 0.5f, cubeRange);
-        AppendBox(vertices, indices, 9.0f, 0.1f, 9.0f, groundRange);        AppendBox(vertices, indices, 0.045f, 1.3f, 0.045f, rodRange);
+        AppendBox(vertices, indices, 9.0f, 0.1f, 9.0f, groundRange);
+        AppendBox(vertices, indices, 0.045f, 1.3f, 0.045f, rodRange);
+        AppendPanel(vertices, indices, panelRange);
+        AppendGrid(vertices, indices, kNonrigidGridCells, gridRange);
 
         vertexBuffer = CreateUploadBuffer(vertices.data(), vertices.size() * sizeof(Vertex), error);
         indexBuffer = CreateUploadBuffer(indices.data(), indices.size() * sizeof(uint32_t), error);
@@ -893,16 +1321,31 @@ struct Renderer::Impl
                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         };
         if (!CreatePipeline(resolvedShader, "ColorVS", "ColorPS", layout, 2,
-                kColorFormat, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_D32_FLOAT, true,
+                kColorFormat, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_D32_FLOAT, true, true, false,
                 D3D12_CULL_MODE_BACK, colorPipeline, error)) return false;
         if (!CreatePipeline(resolvedShader, "GeometryVS", "GeometryPS", layout, 2,
-                kDepthFormat, kMotionFormat, DXGI_FORMAT_D32_FLOAT, true,
+                kDepthFormat, kMotionFormat, DXGI_FORMAT_D32_FLOAT, true, true, false,
                 D3D12_CULL_MODE_BACK, geometryPipeline, error)) return false;
+        if (!CreatePipeline(resolvedShader, "DeformColorVS", "DeformColorPS", layout, 2,
+                kColorFormat, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_D32_FLOAT, true, true, false,
+                D3D12_CULL_MODE_NONE, deformColorPipeline, error)) return false;
+        if (!CreatePipeline(resolvedShader, "DeformGeometryVS", "DeformGeometryPS", layout, 2,
+                kDepthFormat, kMotionFormat, DXGI_FORMAT_D32_FLOAT, true, true, false,
+                D3D12_CULL_MODE_NONE, deformGeometryPipeline, error)) return false;
+        if (!CreatePipeline(resolvedShader, "FlatColorVS", "FlatColorPS", layout, 2,
+                kColorFormat, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_D32_FLOAT, true, true, false,
+                D3D12_CULL_MODE_NONE, flatOpaquePipeline, error)) return false;
+        if (!CreatePipeline(resolvedShader, "FlatColorVS", "FlatColorPS", layout, 2,
+                kColorFormat, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_D32_FLOAT, true, false, true,
+                D3D12_CULL_MODE_NONE, flatTransparentPipeline, error)) return false;
+        if (!CreatePipeline(resolvedShader, "GeometryVS", "GeometryPS", layout, 2,
+                kDepthFormat, kMotionFormat, DXGI_FORMAT_D32_FLOAT, true, true, false,
+                D3D12_CULL_MODE_NONE, flatGeometryPipeline, error)) return false;
         if (!CreatePipeline(resolvedShader, "FullscreenVS", "UiPS", nullptr, 0,
-                kColorFormat, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, false,
+                kColorFormat, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, false, false, false,
                 D3D12_CULL_MODE_NONE, uiPipeline, error)) return false;
         if (!CreatePipeline(resolvedShader, "FullscreenVS", "CompositePS", nullptr, 0,
-                kColorFormat, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, false,
+                kColorFormat, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, false, false, false,
                 D3D12_CULL_MODE_NONE, compositePipeline, error)) return false;
 
         if (!CreateDepthTargets(error)) return false;
@@ -974,25 +1417,94 @@ struct Renderer::Impl
             frameConstantBuffer->GetGPUVirtualAddress());
     }
 
-    void DrawObjects(const FrameState& frameState, bool geometryPass)
+    void SetDeformConstants(const FrameState& frameState)
+    {
+        GpuDeformConstants constants{};
+        constants.primary[0] = kNonrigidPrimaryAmplitude;
+        constants.primary[1] = kNonrigidPrimaryKx;
+        constants.primary[2] = kNonrigidPrimaryKy;
+        constants.primary[3] = kNonrigidPrimaryOmegaX;
+        constants.secondary[0] = kNonrigidPrimaryOmegaY;
+        constants.secondary[1] = kNonrigidSecondaryAmplitude;
+        constants.secondary[2] = kNonrigidSecondaryK;
+        constants.secondary[3] = kNonrigidSecondaryOmega;
+        constants.times[0] = frameState.time;
+        constants.times[1] = frameState.previousTime;
+        constants.times[2] = kNonrigidSecondaryPhase;
+        constants.times[3] = frameState.historyReset ? 1.0f : 0.0f;
+        constants.normalScale[0] = 1.0f / kNonrigidScaleX;
+        constants.normalScale[1] = 1.0f / kNonrigidScaleY;
+        constants.normalScale[2] = 1.0f;
+        commandList->SetGraphicsRoot32BitConstants(3, 16, &constants, 0);
+    }
+
+    const MeshRange& RangeFor(MeshKind mesh) const
+    {
+        if (mesh == MeshKind::Grid) return gridRange;
+        if (mesh == MeshKind::Panel) return panelRange;
+        if (mesh == MeshKind::Ground) return groundRange;
+        if (mesh == MeshKind::Rod) return rodRange;
+        return cubeRange;
+    }
+
+    void SetObjectConstants(const FrameState& frameState, uint32_t index)
+    {
+        const ObjectState& object = frameState.objects[index];
+        GpuObjectConstants constants{};
+        std::memcpy(constants.model, object.world.m, sizeof(constants.model));
+        std::memcpy(constants.previousModel, object.previousWorld.m,
+            sizeof(constants.previousModel));
+        std::memcpy(constants.color, object.color, sizeof(constants.color));
+        constants.params[0] = static_cast<float>(index);
+        commandList->SetGraphicsRoot32BitConstants(0, 40, &constants, 0);
+        const MeshRange& range = RangeFor(object.mesh);
+        commandList->DrawIndexedInstanced(range.indexCount, 1, range.indexOffset, 0, 0);
+    }
+
+    void DrawColorObjects(const FrameState& frameState)
+    {
+        // Opaque first, in state order.
+        for (uint32_t i = 0; i < frameState.objectCount; ++i)
+        {
+            const ObjectState& object = frameState.objects[i];
+            if (object.transparent) continue;
+            if (object.mesh == MeshKind::Grid)
+                commandList->SetPipelineState(deformColorPipeline.Get());
+            else if (object.mesh == MeshKind::Panel)
+                commandList->SetPipelineState(flatOpaquePipeline.Get());
+            else
+                commandList->SetPipelineState(colorPipeline.Get());
+            SetObjectConstants(frameState, i);
+        }
+
+        // Transparent panels back to front into color only.
+        std::vector<uint32_t> transparent;
+        for (uint32_t i = 0; i < frameState.objectCount; ++i)
+            if (frameState.objects[i].transparent) transparent.push_back(i);
+        if (transparent.empty()) return;
+        std::stable_sort(transparent.begin(), transparent.end(),
+            [&frameState](uint32_t left, uint32_t right) {
+                return frameState.objects[left].sortIndex < frameState.objects[right].sortIndex;
+            });
+        commandList->SetPipelineState(flatTransparentPipeline.Get());
+        for (uint32_t index : transparent)
+            SetObjectConstants(frameState, index);
+    }
+
+    void DrawGeometryObjects(const FrameState& frameState)
     {
         for (uint32_t i = 0; i < frameState.objectCount; ++i)
         {
             const ObjectState& object = frameState.objects[i];
-            GpuObjectConstants constants{};
-            std::memcpy(constants.model, object.world.m, sizeof(constants.model));
-            std::memcpy(constants.previousModel, object.previousWorld.m,
-                sizeof(constants.previousModel));
-            std::memcpy(constants.color, object.color, sizeof(constants.color));
-            constants.params[0] = static_cast<float>(i);
-            commandList->SetGraphicsRoot32BitConstants(0, 40, &constants, 0);
-
-            const MeshRange* range = &cubeRange;
-            if (object.mesh == MeshKind::Ground) range = &groundRange;
-            else if (object.mesh == MeshKind::Rod) range = &rodRange;
-            commandList->DrawIndexedInstanced(range->indexCount, 1, range->indexOffset, 0, 0);
+            if (object.transparent || !object.writesDepthMotion) continue;
+            if (object.mesh == MeshKind::Grid)
+                commandList->SetPipelineState(deformGeometryPipeline.Get());
+            else if (object.mesh == MeshKind::Panel)
+                commandList->SetPipelineState(flatGeometryPipeline.Get());
+            else
+                commandList->SetPipelineState(geometryPipeline.Get());
+            SetObjectConstants(frameState, i);
         }
-        (void)geometryPass;
     }
 
     bool RenderFrame(FrameState frameState, bool midpoint, std::string& error)
@@ -1007,6 +1519,7 @@ struct Renderer::Impl
         // Honor an explicit history reset from the harness by zeroing motion.
         if (frameState.historyReset)
         {
+            frameState.previousTime = frameState.time;
             frameState.previousView = frameState.view;
             frameState.previousProjection = frameState.projection;
             frameState.previousViewProjection = frameState.viewProjection;
@@ -1039,6 +1552,7 @@ struct Renderer::Impl
             D3D12_RESOURCE_STATE_RENDER_TARGET);
 
         SetFrameConstants(frameState);
+        SetDeformConstants(frameState);
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         commandList->IASetVertexBuffers(0, 1, &vertexView);
         commandList->IASetIndexBuffer(&indexView);
@@ -1059,8 +1573,7 @@ struct Renderer::Impl
             commandList->ClearRenderTargetView(rtv, colorClear, 0, nullptr);
             commandList->ClearDepthStencilView(colorDepthDsv, D3D12_CLEAR_FLAG_DEPTH,
                 1.0f, 0, 0, nullptr);
-            commandList->SetPipelineState(colorPipeline.Get());
-            DrawObjects(frameState, false);
+            DrawColorObjects(frameState);
         }
 
         // Geometry pass at half output size, writing normalised depth and motion.
@@ -1076,8 +1589,7 @@ struct Renderer::Impl
             commandList->ClearRenderTargetView(rtvs[1], motionClear, 0, nullptr);
             commandList->ClearDepthStencilView(geometryDepthDsv, D3D12_CLEAR_FLAG_DEPTH,
                 1.0f, 0, 0, nullptr);
-            commandList->SetPipelineState(geometryPipeline.Get());
-            DrawObjects(frameState, true);
+            DrawGeometryObjects(frameState);
         }
 
         // UI pass at the output size: frame marker plus premultiplied-alpha crosshair.

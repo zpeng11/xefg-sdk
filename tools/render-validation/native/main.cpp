@@ -14,6 +14,12 @@
 #include "swapchain_capture.h"
 #include "xefg_runtime.h"
 
+#if defined(XEFG_RENDER_VALIDATION_TENSOR_PROBE)
+#include "decode_relay.h"
+#include "dispatch_trace.h"
+#include "trace_writer.h"
+#endif
+
 #include <Windows.h>
 
 #include <algorithm>
@@ -65,6 +71,10 @@ struct Options
     bool debugLayer = false;
     bool tagInterpolated = true;
     bool identityFgMatrices = false; // Diagnostic control; rendering/input textures stay unchanged.
+    // Diagnostic-build only: snapshot one sequential source frame.  The normal
+    // build rejects these instead of silently ignoring them.
+    std::optional<uint32_t> tensorFrame;
+    uint32_t tensorBudgetMB = 1024;
 };
 
 std::wstring Widen(const std::string& text)
@@ -144,7 +154,8 @@ void Usage()
     std::puts(
         "XefgRenderValidation --out <new-dir> [options]\n"
         "  --xess-dir <dir>        folder containing libxess_fg.dll/libxell.dll\n"
-        "  --scene NAME            translation|occlusion|camera|cut (default translation)\n"
+        "  --scene NAME            translation|occlusion|camera|cut|depth_layers|"
+        "screen_cross|camera_turn|nonrigid|transparency (default translation)\n"
         "  --mode N                UI mode 1|3|4 (default 3)\n"
         "  --size WxH              output size 640x360|1280x720|1920x1080|2560x1440|"
         "3840x2160 (default 640x360)\n"
@@ -159,6 +170,10 @@ void Usage()
         "  --no-tag                disable official generated-frame tagging\n"
         "  --identity-fg-matrices  diagnostic: submit identity matrices only to FG\n"
         "  --adapter <substring>   pick a DXGI adapter by name\n"
+#if defined(XEFG_RENDER_VALIDATION_TENSOR_PROBE)
+        "  --tensor-frame N        diagnostic: snapshot one sequential source frame\n"
+        "  --tensor-budget-mb N    diagnostic tensor byte budget (default 1024)\n"
+#endif
         "  --shader <file|dir>     override shaders/scene.hlsl next to the executable\n");
 }
 
@@ -201,6 +216,8 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error)
         else if (argument == "--tag-interpolated") options.tagInterpolated = true;
         else if (argument == "--no-tag") options.tagInterpolated = false;
         else if (argument == "--identity-fg-matrices") options.identityFgMatrices = true;
+        else if (argument == "--tensor-frame") options.tensorFrame = std::stoul(value(i, argument));
+        else if (argument == "--tensor-budget-mb") options.tensorBudgetMB = std::stoul(value(i, argument));
         else
         {
             error = "unknown argument: " + argument;
@@ -215,7 +232,8 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error)
     }
     if (!IsKnownScene(options.scene))
     {
-        error = "--scene expects translation, occlusion, camera, or cut";
+        error = "--scene expects translation, occlusion, camera, cut, depth_layers, "
+            "screen_cross, camera_turn, nonrigid, or transparency";
         return false;
     }
     if (options.mode != 1 && options.mode != 3 && options.mode != 4)
@@ -250,6 +268,40 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error)
         error = "warmup + frames must not exceed 65536";
         return false;
     }
+#if !defined(XEFG_RENDER_VALIDATION_TENSOR_PROBE)
+    if (options.tensorFrame)
+    {
+        error = "--tensor-frame requires a renderer built with "
+            "XEFG_RENDER_VALIDATION_TENSOR_PROBE=ON";
+        return false;
+    }
+#else
+    if (options.tensorFrame)
+    {
+        // Same contract as tools/render-validation/validate.py: one sequential
+        // source frame, inside the run's frames, with a positive budget.
+        if (options.renderOnly)
+        {
+            error = "--tensor-frame is not available with --render-only";
+            return false;
+        }
+        if (options.pairFrame)
+        {
+            error = "--tensor-frame requires a sequential run, not --pair-frame";
+            return false;
+        }
+        if (*options.tensorFrame >= options.warmup + options.frames)
+        {
+            error = "--tensor-frame must be inside the sequential frame range";
+            return false;
+        }
+        if (options.tensorBudgetMB == 0)
+        {
+            error = "--tensor-budget-mb must be positive";
+            return false;
+        }
+    }
+#endif
     if (options.renderOnly && options.warp == false && options.adapterFilter.empty())
     {
         // A hardware adapter is the normal render-only source too; no error.
@@ -626,6 +678,113 @@ std::string ResetFramesJson(SceneKind scene, uint32_t warmup, uint32_t frames, b
     return text.str();
 }
 
+const char* kSceneCameraJson =
+    "{\"eye\":[0,0,0],\"target\":[0,0,-1],\"up\":[0,1,0],\"fov_y_degrees\":50,"
+    "\"near\":0.1,\"far\":100,\"aspect\":1.7777778}";
+
+// Optional extension for the two new scenes.  It carries the analytic mesh,
+// deformation/material contract and ordering; per-frame transforms stay in
+// the regular object records.
+std::string BuildSceneExtensionJson(SceneKind scene)
+{
+    std::ostringstream text;
+    if (scene == SceneKind::Nonrigid)
+    {
+        text << "{\"schema\":\"xefg.render_scene_extension/1\",\"version\":1,"
+                "\"scene\":\"nonrigid\",\"camera\":" << kSceneCameraJson << ","
+             << "\"grid\":{\"cells_x\":" << kNonrigidGridCells
+             << ",\"cells_y\":" << kNonrigidGridCells
+             << ",\"vertices_x\":" << kNonrigidGridVertices
+             << ",\"vertices_y\":" << kNonrigidGridVertices
+             << ",\"vertex_count\":" << (kNonrigidGridVertices * kNonrigidGridVertices)
+             << ",\"triangle_count\":" << (kNonrigidGridCells * kNonrigidGridCells * 2)
+             << ",\"local_x_range\":[-1,1],\"local_y_range\":[-1,1],"
+                "\"vertex_order\":\"row-major iy*(cells_x+1)+ix\","
+                "\"cell_triangles\":\"(a,b,d),(a,d,c) with a=iy*(cells_x+1)+ix,b=a+1,"
+                "c=a+cells_x+1,d=c+1\",\"winding\":\"ccw_from_plus_z\"},"
+             << "\"deformation\":{\"formula\":\"z=A1*sin(kx*x+w1*t)*cos(ky*y+w2*t)+"
+                "A2*sin(k2*(x+y)+w3*t+phi2)\",\"A1\":" << kNonrigidPrimaryAmplitude
+             << ",\"kx\":" << kNonrigidPrimaryKx << ",\"ky\":" << kNonrigidPrimaryKy
+             << ",\"w1\":" << kNonrigidPrimaryOmegaX << ",\"w2\":" << kNonrigidPrimaryOmegaY
+             << ",\"A2\":" << kNonrigidSecondaryAmplitude << ",\"k2\":" << kNonrigidSecondaryK
+             << ",\"w3\":" << kNonrigidSecondaryOmega << ",\"phi2\":" << kNonrigidSecondaryPhase
+             << ",\"dzdx_formula\":\"A1*kx*cos(kx*x+w1*t)*cos(ky*y+w2*t)+"
+                "A2*k2*cos(k2*(x+y)+w3*t+phi2)\","
+                "\"dzdy_formula\":\"-A1*ky*sin(kx*x+w1*t)*sin(ky*y+w2*t)+"
+                "A2*k2*cos(k2*(x+y)+w3*t+phi2)\","
+                "\"normal_local\":\"normalize((-dzdx,-dzdy,1))\","
+                "\"normal_world\":\"normalize((n.x/2.7,n.y/1.5,n.z/1.0))\","
+                "\"world\":\"p=(2.7x,1.5y,z_local-4.2)\","
+                "\"time\":\"state.time\",\"previous_time\":\"state.previousTime\","
+                "\"previous_time_note\":\"MakeFrameState: t-1, or source_frame-1 for midpoint; "
+                "history reset sets previous_time=time\","
+                "\"reset\":\"previous_time=time, previous_position=current\","
+                "\"midpoint\":\"time=source_frame-0.5, previous_time=source_frame-1\"},"
+             << "\"shading\":{\"diffuse\":\"saturate(dot(n_world,normalize((0.35,0.80,0.45))))\","
+                "\"rgb\":\"ObjectColor.rgb*(0.22+0.78*diffuse)+"
+                "pow(saturate(1-abs(n_world.z)),2)*0.10\",\"alpha\":1},"
+                "\"objects\":[{\"name\":\"deform_panel\",\"role\":\"deforming_grid\","
+                "\"mesh\":\"grid\"},{\"name\":\"static_backdrop\",\"role\":\"static_background\","
+                "\"mesh\":\"cube\"}]}";
+        return text.str();
+    }
+    if (scene == SceneKind::Transparency)
+    {
+        text << "{\"schema\":\"xefg.render_scene_extension/1\",\"version\":1,"
+                "\"scene\":\"transparency\",\"camera\":" << kSceneCameraJson << ","
+             << "\"policy\":{\"color_writes\":\"opaque_then_transparent\","
+                "\"depth_motion\":\"opaque_only\",\"transparent_depth_write\":false,"
+                "\"transparent_writes_mv\":false,\"ui\":\"untouched\","
+                "\"opaque_scene_static\":true},"
+                "\"blend\":{\"mode\":\"premultiplied_alpha\",\"rgb_src\":\"ONE\","
+                "\"rgb_dst\":\"INV_SRC_ALPHA\",\"alpha_src\":\"ONE\","
+                "\"alpha_dst\":\"INV_SRC_ALPHA\",\"equation\":\"L=S+D*(1-alpha_s)\"},"
+                "\"draw_order\":[\"backdrop\",\"blocker\",\"plane_far\",\"plane_near\"],"
+                "\"regions\":{\"single_far\":\"A minus B minus blocker\","
+                "\"single_near\":\"B minus A minus blocker\","
+                "\"double\":\"A intersect B minus blocker\","
+                "\"occluded\":\"blocker area covered by A or B\"},"
+                "\"motion\":{\"plane_far\":\"xA=-0.15+0.35*sin(0.50*t),"
+                "yA=-0.30+0.10*cos(0.37*t)\",\"plane_near\":"
+                "\"xB=0.10+0.30*sin(0.40*t+1.30),yB=0.35+0.08*sin(0.31*t+0.60)\","
+                "\"time\":\"state.time\",\"previous_time\":\"state.previousTime\"},"
+                "\"objects\":["
+                "{\"name\":\"backdrop\",\"role\":\"opaque_backdrop\",\"mesh\":\"panel\","
+                "\"rgba\":[0.10,0.15,0.24,1.0],"
+                "\"premultiplied_rgba\":[0.10,0.15,0.24,1.0],\"depth_test\":true,"
+                "\"depth_write\":true,\"writes_depth_motion\":true,\"sort_index\":0},"
+                "{\"name\":\"blocker\",\"role\":\"opaque_blocker\",\"mesh\":\"panel\","
+                "\"rgba\":[0.20,0.24,0.26,1.0],"
+                "\"premultiplied_rgba\":[0.20,0.24,0.26,1.0],\"depth_test\":true,"
+                "\"depth_write\":true,\"writes_depth_motion\":true,\"sort_index\":1},"
+                "{\"name\":\"plane_far\",\"role\":\"transparent_plane\",\"mesh\":\"panel\","
+                "\"rgba\":[0.80,0.22,0.18,0.55],"
+                "\"premultiplied_rgba\":[0.44,0.121,0.099,0.55],\"depth_test\":true,"
+                "\"depth_write\":false,\"writes_depth_motion\":false,\"sort_index\":2},"
+                "{\"name\":\"plane_near\",\"role\":\"transparent_plane\",\"mesh\":\"panel\","
+                "\"rgba\":[0.16,0.60,0.78,0.45],"
+                "\"premultiplied_rgba\":[0.072,0.27,0.351,0.45],\"depth_test\":true,"
+                "\"depth_write\":false,\"writes_depth_motion\":false,\"sort_index\":3}]}";
+        return text.str();
+    }
+    return {};
+}
+
+void PopulateObjectMaterial(SceneObjectRecord& record, const ObjectState& object)
+{
+    record.hasMaterial = true;
+    record.role = object.role;
+    record.mesh = MeshName(object.mesh);
+    for (int i = 0; i < 4; ++i) record.flatColor[static_cast<size_t>(i)] = object.color[i];
+    const float alpha = object.color[3];
+    record.premultipliedColor = {object.color[0] * alpha, object.color[1] * alpha,
+        object.color[2] * alpha, alpha};
+    record.transparent = object.transparent;
+    record.depthWrite = object.depthWrite;
+    record.writesDepthMotion = object.writesDepthMotion;
+    record.sortIndex = object.sortIndex;
+}
+
 bool WriteMetaJson(const std::filesystem::path& path, const Options& options, SceneKind scene,
     const RenderSize& size, bool warp, const std::string& adapterName,
     const DXGI_ADAPTER_DESC1& adapterDescription,
@@ -861,6 +1020,14 @@ int main(int argc, char** argv)
     const bool tagRequested = !options.renderOnly && options.tagInterpolated;
     const ModeInfo modeInfo = ModeFor(options.mode);
 
+#if defined(XEFG_RENDER_VALIDATION_TENSOR_PROBE)
+    std::unique_ptr<probe::TraceWriter> tensorTrace;
+    std::unique_ptr<probe::DecodeRelay> tensorRelay;
+    std::unique_ptr<probe::DispatchTrace> tensorDispatcher;
+    bool tensorCaptureOk = true;
+    std::string tensorWaitError;
+#endif
+
     if (!options.renderOnly)
     {
         if (!runtime.Load(Widen(options.xessDirectory), error))
@@ -871,6 +1038,17 @@ int main(int argc, char** argv)
         moduleHash = oracle::ModuleFileSha256(runtime.fg);
         std::printf("provider sha256: %s\n", moduleHash.c_str());
 
+#if defined(XEFG_RENDER_VALIDATION_TENSOR_PROBE)
+        if (options.tensorFrame
+            && _stricmp(moduleHash.c_str(), oracle::kProfiledFg78Sha256) != 0)
+        {
+            std::fprintf(stderr,
+                "tensor capture is calibrated for fg78 %s; refusing %s\n",
+                oracle::kProfiledFg78Sha256, moduleHash.c_str());
+            return 1;
+        }
+#endif
+
         capture = std::make_shared<oracle::CaptureContext>();
         if (!capture->Initialize(fixture.device.Get(), fixture.queue.Get(),
             (outputDirectory / L"captures").wstring(), error))
@@ -878,6 +1056,53 @@ int main(int argc, char** argv)
             std::fprintf(stderr, "capture initialization failed: %s\n", error.c_str());
             return 1;
         }
+
+#if defined(XEFG_RENDER_VALIDATION_TENSOR_PROBE)
+        // Install after the capture context so its private queue is not mistaken
+        // for a provider queue, but before CreateContext so every provider queue,
+        // command list and pipeline is observed.  The present capture wrappers are
+        // COM delegations, not vtable patches, so they do not conflict.
+        if (options.tensorFrame)
+        {
+            error.clear();
+            tensorTrace = std::make_unique<probe::TraceWriter>();
+            if (!tensorTrace->Open(outputDirectory / L"trace", error))
+            {
+                std::fprintf(stderr, "tensor trace open failed: %s\n", error.c_str());
+                return 1;
+            }
+            tensorRelay = std::make_unique<probe::DecodeRelay>();
+            if (!tensorRelay->Install(runtime.fg, *tensorTrace,
+                outputDirectory / L"trace" / L"shaders",
+                outputDirectory / L"trace" / L"params", error))
+            {
+                std::fprintf(stderr, "decode relay install failed: %s\n", error.c_str());
+                return 1;
+            }
+            tensorDispatcher = std::make_unique<probe::DispatchTrace>();
+            probe::DispatchTraceOptions tensorOptions;
+            tensorOptions.tensors = true;
+            tensorOptions.tensorBudgetMB = options.tensorBudgetMB;
+            tensorOptions.tensorDispatches = 0;
+            tensorOptions.tensorFirstFrame = *options.tensorFrame;
+            tensorOptions.tensorLastFrame = *options.tensorFrame;
+            tensorOptions.tensorDirectory = outputDirectory / L"trace" / L"tensors";
+            tensorDispatcher->SetOptions(tensorOptions);
+            if (!tensorDispatcher->Install(fixture.device.Get(), fixture.commands.Get(),
+                *tensorTrace, *tensorRelay, error))
+            {
+                std::fprintf(stderr, "dispatch trace install failed: %s\n", error.c_str());
+                return 1;
+            }
+            if (!tensorDispatcher->TensorEnabled())
+            {
+                std::fprintf(stderr, "tensor dump could not be initialized\n");
+                return 1;
+            }
+            std::printf("tensor capture: frame %u budget %u MB\n",
+                *options.tensorFrame, options.tensorBudgetMB);
+        }
+#endif
 
         DXGI_SWAP_CHAIN_DESC1 chainDescription{};
         chainDescription.Width = renderSize.width;
@@ -1022,6 +1247,13 @@ int main(int argc, char** argv)
         state.uiEnabled = modeInfo.ui;
         midpointState.uiEnabled = modeInfo.ui;
 
+#if defined(XEFG_RENDER_VALIDATION_TENSOR_PROBE)
+        // The provider dispatches for this submission happen during Present.
+        // The trace stamps every dispatch with this source frame and only the
+        // selected frame is allowed to retain tensor snapshots.
+        if (tensorDispatcher) tensorDispatcher->SetFrame(sourceFrame);
+#endif
+
         if (!renderer.Render(midpointState, sceneKind, true, error))
         {
             std::fprintf(stderr, "midpoint render failed at frame %u: %s\n", localFrame, error.c_str());
@@ -1065,6 +1297,13 @@ int main(int argc, char** argv)
         std::memcpy(record.projection.data(), state.projection.m, sizeof(state.projection.m));
         record.time = state.time;
         record.previousTime = state.previousTime;
+        const bool materialScene = sceneKind == SceneKind::Nonrigid
+            || sceneKind == SceneKind::Transparency;
+        if (sceneKind == SceneKind::Nonrigid)
+        {
+            record.hasDeformation = true;
+            record.previousIsCurrent = resetHistory || state.previousTime == state.time;
+        }
         for (uint32_t objectIndex = 0;
              objectIndex < std::min<uint32_t>(state.objectCount, kMaxObjects); ++objectIndex)
         {
@@ -1073,6 +1312,7 @@ int main(int argc, char** argv)
             std::memcpy(object.world.data(), state.objects[objectIndex].world.m, sizeof(object.world));
             std::memcpy(object.previousWorld.data(), state.objects[objectIndex].previousWorld.m,
                 sizeof(object.previousWorld));
+            if (materialScene) PopulateObjectMaterial(object, state.objects[objectIndex]);
             record.objects.push_back(std::move(object));
         }
 
@@ -1177,6 +1417,7 @@ int main(int argc, char** argv)
     sceneManifest.shaderSource = shaderSource;
     sceneManifest.shaderSha256 = shaderHash;
     sceneManifest.rendererVersion = kRendererVersion;
+    sceneManifest.sceneExtensionJson = BuildSceneExtensionJson(sceneKind);
     sceneManifest.frames = std::move(sceneFrames);
     if (!WriteSceneManifest(outputDirectory / L"scene.json", sceneManifest, error))
     {
@@ -1189,6 +1430,79 @@ int main(int argc, char** argv)
     {
         fixture.SignalAndWait();
         proxy.Reset();
+#if defined(XEFG_RENDER_VALIDATION_TENSOR_PROBE)
+        // The provider's own present queue carries the tensor copies.  Drain it
+        // and write the readbacks before destroying the context that owns it.
+        if (tensorDispatcher)
+        {
+            tensorCaptureOk = tensorDispatcher->FinishTensors(tensorWaitError);
+            const size_t tensorFiles = tensorDispatcher->TensorFiles();
+            const uint64_t tensorBytes = tensorDispatcher->TensorBytes();
+            const uint64_t tensorBudget = tensorDispatcher->TensorBudgetBytes();
+            const bool tensorEnabled = tensorDispatcher->TensorEnabled();
+            const size_t providerQueues = tensorDispatcher->ProviderQueues();
+            const std::string traceError = tensorDispatcher->Error();
+
+            if (tensorFiles == 0 && tensorWaitError.empty())
+            {
+                tensorCaptureOk = false;
+                tensorWaitError = "no tensor snapshots were written for the selected frame";
+            }
+            else if (!tensorEnabled && tensorWaitError.empty())
+            {
+                tensorCaptureOk = false;
+                tensorWaitError =
+                    "tensor capture stopped before the selected frame completed (budget or allocation)";
+            }
+            if (!traceError.empty())
+            {
+                tensorCaptureOk = false;
+                if (tensorWaitError.empty()) tensorWaitError = traceError;
+            }
+            if (!tensorCaptureOk)
+                std::fprintf(stderr, "tensor capture incomplete: %s\n", tensorWaitError.c_str());
+            else
+                std::printf("tensor capture complete: %zu files, %llu bytes\n",
+                    tensorFiles, static_cast<unsigned long long>(tensorBytes));
+
+            if (tensorTrace)
+            {
+                std::ostringstream meta;
+                meta << "{\n";
+                meta << "  \"schema\": \"xefg.tensor_trace/1\",\n";
+                meta << "  \"complete\": " << (tensorCaptureOk ? "true" : "false") << ",\n";
+                meta << "  \"error\": \"" << probe::JsonEscape(tensorCaptureOk ? "" : tensorWaitError)
+                     << "\",\n";
+                meta << "  \"wait_error\": \"" << probe::JsonEscape(tensorWaitError) << "\",\n";
+                meta << "  \"trace_error\": \"" << probe::JsonEscape(traceError) << "\",\n";
+                meta << "  \"tensor_enabled\": " << (tensorEnabled ? "true" : "false") << ",\n";
+                meta << "  \"tensor_files\": " << tensorFiles << ",\n";
+                meta << "  \"tensor_bytes\": " << tensorBytes << ",\n";
+                meta << "  \"tensor_budget_bytes\": " << tensorBudget << ",\n";
+                meta << "  \"tensor_frame\": " << *options.tensorFrame << ",\n";
+                meta << "  \"tensor_first_frame\": " << *options.tensorFrame << ",\n";
+                meta << "  \"tensor_last_frame\": " << *options.tensorFrame << ",\n";
+                meta << "  \"dispatches\": " << tensorDispatcher->DispatchCount() << ",\n";
+                meta << "  \"distinct_programs\": " << tensorDispatcher->DistinctPrograms() << ",\n";
+                meta << "  \"patched_tables\": " << tensorDispatcher->PatchedListTables() << ",\n";
+                meta << "  \"provider_queues\": " << providerQueues << ",\n";
+                meta << "  \"programs\": " << tensorRelay->ProgramCount() << ",\n";
+                meta << "  \"parameter_captures\": " << tensorRelay->ParameterCaptureCount() << ",\n";
+                meta << "  \"xefg_family\": \"fg78\",\n";
+                meta << "  \"xefg_dll_sha256\": \"" << probe::JsonEscape(moduleHash) << "\",\n";
+                meta << "  \"configuration\": {\"scene\": \"" << probe::JsonEscape(options.scene)
+                     << "\", \"mode\": " << options.mode
+                     << ", \"width\": " << renderSize.width
+                     << ", \"height\": " << renderSize.height
+                     << ", \"warmup\": " << options.warmup
+                     << ", \"frames\": " << options.frames << "}\n";
+                meta << "}\n";
+                tensorTrace->SetMeta(meta.str());
+                tensorTrace->Flush();
+            }
+            tensorDispatcher->Detach();
+        }
+#endif
         setup.destroy = static_cast<int32_t>(runtime.xefgSwapChainDestroy(fg));
         fg = nullptr;
         capture->SetEnabled(false);
@@ -1239,6 +1553,12 @@ int main(int argc, char** argv)
 
     if (captureFactory) captureFactory.Reset();
     if (xell) runtime.xellDestroyContext(xell);
+#if defined(XEFG_RENDER_VALIDATION_TENSOR_PROBE)
+    // Restore the provider's decoder and close the trace before the module is
+    // unmapped; the exhausted trace also has no more live objects to reference.
+    if (tensorRelay) tensorRelay->Restore();
+    if (tensorTrace) tensorTrace->Close();
+#endif
     if (!options.renderOnly) runtime.Unload();
     if (options.debugLayer)
     {
@@ -1249,6 +1569,14 @@ int main(int argc, char** argv)
     }
     std::printf("render validation output written to %s\n", outputDirectory.string().c_str());
     if (!options.renderOnly && (!presentsWritten || !capture->Error().empty())) return 1;
+#if defined(XEFG_RENDER_VALIDATION_TENSOR_PROBE)
+    if (!tensorCaptureOk)
+    {
+        std::fprintf(stderr, "tensor capture incomplete; see trace/meta.json: %s\n",
+            tensorWaitError.c_str());
+        return 1;
+    }
+#endif
     if (apiFailure)
     {
         std::fprintf(stderr, "one or more public API calls reported failure; manifests retain the results\n");

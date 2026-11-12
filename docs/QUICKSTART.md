@@ -196,21 +196,24 @@ python -I examples/pair.py --manifest work/sequence/sequence.json --package work
 
 - No performance, frame-rate, latency, memory, or supported-NPU guarantee.
 - No last-bit precision promise against Intel XeFG, OptiScaler, or a captured
-  reference. Historical equality was to the project's research reconstruction,
-  not the provider. Mode 4 is validated at 640×360 with a small remaining
-  provider residual; no equality is claimed.
+  reference. The exported ONNX graph and SDK runtime reproduce the project's own
+  research reconstruction exactly on inspected frames; comparison with
+  official/provider output is bounded, not exact, so no provider equality is
+  claimed.
 - Only `NONE` (mode 1), `HUDLESS_UITEXTURE` (mode 3), and explicit
   `BACKBUFFER_HUDLESS` (mode 4) are implemented; other public enum names parse
   but raise. `AUTO` still resolves only modes 1 and 3.
 - Only the profiles shipped in the package are supported. There is no
   arbitrary-resolution or arbitrary-format promise. Mode-4 profiles exist at
-  all five sizes and match the full research reconstruction exactly on both
-  frames; 640×360 used independent application images and larger sizes used
-  application-shaped arrays recovered from capture resources.
+  all five sizes and match the project's own research reconstruction exactly on
+  both frames; official comparisons retain a bounded residual (see
+  [Compatibility §5.4](COMPATIBILITY.md#54-d25-sampling-precision)). 640×360
+  used independent application images and larger sizes used application-shaped
+  arrays recovered from capture resources.
 - There is no engine adapter in this SDK. The caller or a future adapter is
   responsible for complete motion vectors, jitter compensation, and adapting
   engine depth to the fg78 raw non-inverted model contract.
-- The retained capture scene exercises only depth values `1.0` and `100.0`, so
+- The analytical probe scene exercises only depth values `1.0` and `100.0`, so
   no full device-depth-range claim is made.
 - The application is responsible for providing correctly normalized inputs and
   for presenting the generated image. The SDK does not create a swapchain or

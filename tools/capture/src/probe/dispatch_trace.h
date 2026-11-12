@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -37,6 +38,12 @@ struct DispatchTraceOptions
     uint32_t tensorBudgetMB = 512;
     uint32_t tensorDispatches = 0; // 0 = every dispatch
     std::filesystem::path tensorDirectory;
+    // Optional inclusive frame window for tensor snapshots.  Dispatch events
+    // are still written for every frame; only the large snapshots are limited
+    // to the selected frames.  Both unset preserves the original behaviour of
+    // snapshotting every frame.
+    std::optional<uint32_t> tensorFirstFrame;
+    std::optional<uint32_t> tensorLastFrame;
 };
 
 class DispatchTrace
@@ -60,6 +67,18 @@ public:
     size_t PatchedListTables() const;
     size_t TensorFiles() const;
     uint64_t TensorBytes() const;
+    // Tensor capture can stop early when the byte budget or a readback
+    // allocation fails; this reports whether it is still active.
+    bool TensorEnabled() const;
+    uint64_t TensorBudgetBytes() const;
+    // Inclusive frame predicate; true when tensorFirstFrame/tensorLastFrame
+    // leave `frame` selected.  Unset bounds select every frame.
+    static constexpr bool TensorFrameSelected(const DispatchTraceOptions& options, uint32_t frame)
+    {
+        if (options.tensorFirstFrame && frame < *options.tensorFirstFrame) return false;
+        if (options.tensorLastFrame && frame > *options.tensorLastFrame) return false;
+        return true;
+    }
     const std::string& Error() const { return error_; }
 
     // Hook implementations (public so the static stubs can reach them).

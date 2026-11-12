@@ -248,6 +248,143 @@ void TestRenderSizeTypes()
     Check(uhd.GeometryWidth() == 1920 && uhd.GeometryHeight() == 1080, "4K geometry is half size");
 }
 
+void TestNewSceneNamesAndStates()
+{
+    Check(kSceneCount == 9, "nine scenes are registered");
+    Check(static_cast<uint32_t>(SceneKind::Translation) == 0
+        && static_cast<uint32_t>(SceneKind::Occlusion) == 1
+        && static_cast<uint32_t>(SceneKind::Camera) == 2
+        && static_cast<uint32_t>(SceneKind::Cut) == 3,
+        "original four scene values are unchanged");
+    Check(static_cast<uint32_t>(SceneKind::Nonrigid) == 7
+        && static_cast<uint32_t>(SceneKind::Transparency) == 8,
+        "opt-in scene values are appended");
+    const char* names[5] = {"depth_layers", "screen_cross", "camera_turn",
+        "nonrigid", "transparency"};
+    for (size_t i = 0; i < 5; ++i)
+    {
+        const SceneKind scene = static_cast<SceneKind>(4 + i);
+        SceneKind parsed = SceneKind::Translation;
+        Check(IsKnownScene(names[i]), std::string("known scene ") + names[i]);
+        Check(SceneFromName(names[i], parsed) && parsed == scene,
+            std::string("scene name maps to enum ") + names[i]);
+
+        const FrameState state = MakeFrameState(scene, 5, false);
+        Check(state.objectCount > 0 && state.objectCount <= kMaxObjects,
+            std::string(names[i]) + " uses a separate bounded object list");
+        for (uint32_t object = 0; object < state.objectCount; ++object)
+            Check(state.objects[object].name != "ground"
+                && state.objects[object].name.rfind("rod", 0) != 0,
+                std::string(names[i]) + " does not reuse the old object list");
+    }
+}
+
+void TestNonrigidContract()
+{
+    const FrameState state = MakeFrameState(SceneKind::Nonrigid, 5, false);
+    Check(state.objectCount == 2, "nonrigid has the grid and one static background");
+    Check(state.objects[0].mesh == MeshKind::Grid
+        && state.objects[0].name == "deform_panel",
+        "nonrigid first object is the subdivided grid");
+    Check(state.objects[1].name == "static_backdrop" && !state.objects[1].transparent,
+        "nonrigid background is static opaque geometry");
+    const Matrix4& world = state.objects[0].world;
+    Check(std::abs(world.m[0] - kNonrigidScaleX) < 1e-5f
+        && std::abs(world.m[5] - kNonrigidScaleY) < 1e-5f
+        && std::abs(world.m[14] - kNonrigidTranslateZ) < 1e-5f,
+        "nonrigid grid world transform matches the contract");
+    Check(std::memcmp(state.objects[0].world.m, state.objects[0].previousWorld.m,
+        sizeof(state.objects[0].world.m)) == 0,
+        "nonrigid grid world transform is fixed");
+
+    float current[3], previous[3], resetPosition[3];
+    NonrigidWorldPosition(0.35f, -0.25f, state.time, current);
+    NonrigidWorldPosition(0.35f, -0.25f, state.previousTime, previous);
+    NonrigidWorldPosition(0.35f, -0.25f, state.time, resetPosition);
+    const float dx = current[0] - previous[0];
+    const float dy = current[1] - previous[1];
+    const float dz = current[2] - previous[2];
+    const float previousDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    Check(previousDistance > 0.05f,
+        "nonrigid previous deformation is a real vertex position change");
+    Check(resetPosition[2] == current[2],
+        "nonrigid same-time position is stable");
+
+    const FrameState reset = MakeFrameState(SceneKind::Nonrigid, 0, false);
+    Check(reset.previousTime == reset.time, "nonrigid reset frame previous time equals current");
+
+    const FrameState midpoint = MakeFrameState(SceneKind::Nonrigid, 4, true);
+    Check(std::abs(midpoint.time - 3.5f) < 1e-6f
+        && std::abs(midpoint.previousTime - 3.0f) < 1e-6f,
+        "nonrigid midpoint preserves MakeFrameState time semantics");
+    float midpointPosition[3];
+    NonrigidWorldPosition(0.35f, -0.25f, midpoint.time, midpointPosition);
+    Check(std::abs(midpointPosition[2] - current[2]) > 1e-3f,
+        "nonrigid midpoint samples the continuous deformation");
+
+    float normalA[3], normalB[3];
+    NonrigidNormalLocal(0.35f, -0.25f, 4.0f, normalA);
+    NonrigidNormalLocal(0.35f, -0.25f, 5.0f, normalB);
+    const float length = std::sqrt(normalA[0] * normalA[0] + normalA[1] * normalA[1]
+        + normalA[2] * normalA[2]);
+    Check(std::abs(length - 1.0f) < 1e-4f && normalA[2] > 0.0f,
+        "nonrigid analytic normal is unit length and faces the camera");
+    Check(std::abs(normalA[0] - normalB[0]) + std::abs(normalA[1] - normalB[1])
+        + std::abs(normalA[2] - normalB[2]) > 1e-3f,
+        "nonrigid normals follow the deformation");
+}
+
+void TestTransparencyContract()
+{
+    const FrameState state = MakeFrameState(SceneKind::Transparency, 5, false);
+    Check(state.objectCount == 4, "transparency has backdrop, blocker and two planes");
+    const char* expected[4] = {"backdrop", "blocker", "plane_far", "plane_near"};
+    for (uint32_t i = 0; i < 4; ++i)
+        Check(state.objects[i].name == expected[i], "transparency object order");
+    Check(!state.objects[0].transparent && !state.objects[1].transparent
+        && state.objects[2].transparent && state.objects[3].transparent,
+        "transparency draws opaque objects before transparent objects");
+    Check(state.objects[2].sortIndex == 2 && state.objects[3].sortIndex == 3
+        && state.objects[2].mesh == MeshKind::Panel,
+        "transparent planes are sorted far to near");
+    Check(state.objects[0].writesDepthMotion && state.objects[1].writesDepthMotion
+        && !state.objects[2].writesDepthMotion && !state.objects[3].writesDepthMotion,
+        "transparency depth/motion is opaque-only");
+    Check(state.objects[0].depthWrite && state.objects[1].depthWrite
+        && !state.objects[2].depthWrite && !state.objects[3].depthWrite,
+        "transparent depth writes are disabled");
+    Check(std::abs(state.objects[2].color[3] - 0.55f) < 1e-6f
+        && std::abs(state.objects[3].color[3] - 0.45f) < 1e-6f,
+        "transparent material alphas match the contract");
+
+    for (int i = 0; i < 2; ++i)
+        Check(std::memcmp(state.objects[i].world.m, state.objects[i].previousWorld.m,
+            sizeof(state.objects[i].world.m)) == 0,
+            "opaque transparency geometry is static");
+    Check(std::memcmp(state.objects[2].world.m, state.objects[2].previousWorld.m,
+        sizeof(state.objects[2].world.m)) != 0,
+        "far transparent plane moves independently");
+    Check(std::memcmp(state.objects[3].world.m, state.objects[3].previousWorld.m,
+        sizeof(state.objects[3].world.m)) != 0,
+        "near transparent plane moves independently");
+
+    const FrameState reset = MakeFrameState(SceneKind::Transparency, 0, false);
+    for (uint32_t i = 0; i < reset.objectCount; ++i)
+        Check(std::memcmp(reset.objects[i].world.m, reset.objects[i].previousWorld.m,
+            sizeof(reset.objects[i].world.m)) == 0,
+            "transparency reset previous transforms equal current");
+
+    const FrameState midpoint = MakeFrameState(SceneKind::Transparency, 4, true);
+    Check(std::abs(midpoint.time - 3.5f) < 1e-6f
+        && std::abs(midpoint.previousTime - 3.0f) < 1e-6f,
+        "transparency midpoint preserves MakeFrameState time semantics");
+    const float expectedFarX = -0.15f + 0.35f * std::sin(0.50f * 3.5f);
+    const float expectedNearX = 0.10f + 0.30f * std::sin(0.40f * 3.5f + 1.30f);
+    Check(std::abs(midpoint.objects[2].world.m[12] - expectedFarX) < 1e-5f
+        && std::abs(midpoint.objects[3].world.m[12] - expectedNearX) < 1e-5f,
+        "transparency plane motion uses the contract formulas at midpoint");
+}
+
 void TestMatrixConventions()
 {
     const auto transform = [](const float point[4], const Matrix4& matrix) {
@@ -398,6 +535,8 @@ void TestSceneManifestSchema()
     std::filesystem::remove(path);
 
     Check(text.find("\"mode\": 1") != std::string::npos, "scene manifest records mode");
+    Check(text.find("\"scene_extension\"") == std::string::npos,
+        "original scenes keep the optional extension absent");
     Check(text.find("\"pairing_method\": \"isolated_pair\"") != std::string::npos,
         "scene manifest records isolated pairing method");
     Check(text.find("\"source_pair\": [4, 5]") != std::string::npos,
@@ -487,7 +626,62 @@ void TestSceneManifestSchema()
     }
 }
 
-bool TestScene(Renderer& renderer, SceneKind scene){
+void TestSceneExtensionManifest()
+{
+    SceneManifest manifest;
+    manifest.name = "nonrigid";
+    manifest.mode = 1;
+    manifest.warmup = 0;
+    manifest.measuredFrames = 1;
+    manifest.sceneExtensionJson =
+        "{\"schema\":\"xefg.render_scene_extension/1\",\"version\":1,"
+        "\"scene\":\"nonrigid\",\"grid\":{\"cells_x\":64}}";
+    SceneFrameRecord frame;
+    frame.time = 5.0f;
+    frame.previousTime = 4.0f;
+    frame.hasDeformation = true;
+    frame.previousIsCurrent = false;
+    SceneObjectRecord object;
+    object.name = "plane_far";
+    object.hasMaterial = true;
+    object.role = "transparent_plane";
+    object.mesh = "panel";
+    object.flatColor = {0.80f, 0.22f, 0.18f, 0.55f};
+    object.premultipliedColor = {0.44f, 0.121f, 0.099f, 0.55f};
+    object.transparent = true;
+    object.depthWrite = false;
+    object.writesDepthMotion = false;
+    object.sortIndex = 2;
+    frame.objects.push_back(object);
+    manifest.frames.push_back(frame);
+
+    const std::filesystem::path path = std::filesystem::temp_directory_path()
+        / "xefg_render_validation_extension_test.json";
+    std::string error;
+    if (!WriteSceneManifest(path, manifest, error))
+    {
+        std::printf("FAIL: extension manifest write: %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    std::ifstream file(path, std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    file.close();
+    std::filesystem::remove(path);
+    Check(text.find("\"scene_extension\": {\"schema\":\"xefg.render_scene_extension/1\"")
+        != std::string::npos, "scene manifest emits scene_extension");
+    Check(text.find("\"deformation\": {\"time\": 5") != std::string::npos,
+        "scene manifest emits per-frame deformation state");
+    Check(text.find("\"mesh\": \"panel\"") != std::string::npos
+        && text.find("\"transparent\": true") != std::string::npos
+        && text.find("\"writes_depth_motion\": false") != std::string::npos
+        && text.find("\"sort_index\": 2") != std::string::npos,
+        "scene manifest emits material/depth/order fields");
+}
+
+
+bool TestScene(Renderer& renderer, SceneKind scene)
+{
     const std::string sceneName = kSceneNames[static_cast<size_t>(scene)];
     std::printf("scene %s\n", sceneName.c_str());
     std::string error;
@@ -646,6 +840,331 @@ bool TestScene(Renderer& renderer, SceneKind scene){
     return true;
 }
 
+bool PreviousClipPositive(const FrameState& state, std::string& error)
+{
+    for (uint32_t object = 0; object < state.objectCount; ++object)
+    {
+        const ObjectState& item = state.objects[object];
+        for (int corner = 0; corner < 8; ++corner)
+        {
+            const float extent = item.mesh == MeshKind::Cube ? 0.5f : 0.0f;
+            const float point[4] = {
+                (corner & 1) ? extent : -extent,
+                (corner & 2) ? extent : -extent,
+                (corner & 4) ? extent : -extent,
+                1.0f};
+            float world[4]{};
+            for (int column = 0; column < 4; ++column)
+                for (int row = 0; row < 4; ++row)
+                    world[column] += point[row] * item.previousWorld.m[row * 4 + column];
+            float clip[4]{};
+            for (int column = 0; column < 4; ++column)
+                for (int row = 0; row < 4; ++row)
+                    clip[column] += world[row] * state.previousViewProjection.m[row * 4 + column];
+            if (clip[3] <= 0.05f)
+            {
+                error = item.name + " previous clip w is not positive";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool TestDepthLayersCoverage(Renderer& renderer)
+{
+    std::string error;
+    double foreground = 0.0;
+    double nearPixels = 0.0;
+    double farPixels = 0.0;
+    for (uint32_t frame = 0; frame < kTotalFrames; ++frame)
+    {
+        const FrameState state = MakeFrameState(SceneKind::DepthLayers, frame, false);
+        std::vector<uint8_t> depth;
+        std::vector<uint8_t> motion;
+        if (!renderer.Render(state, SceneKind::DepthLayers, false, error)
+            || !Readback(renderer.Depth(), depth, error)
+            || !Readback(renderer.Motion(), motion, error))
+        {
+            std::printf("FAIL: depth_layers frame %u: %s\n", frame, error.c_str());
+            return false;
+        }
+        if (!PreviousClipPositive(state, error))
+        {
+            std::printf("FAIL: depth_layers frame %u: %s\n", frame, error.c_str());
+            return false;
+        }
+        const MotionStats motionStats = ComputeMotionStats(motion);
+        Check(motionStats.finite, "depth_layers motion finite");
+        if (frame > 0) Check(motionStats.nonZeroPixels > 0.0,
+            "depth_layers has foreground motion");
+
+        const float* values = reinterpret_cast<const float*>(depth.data());
+        for (size_t i = 0; i < depth.size() / sizeof(float); ++i)
+        {
+            if (values[i] >= 0.9999f) continue;
+            foreground += 1.0;
+            if (values[i] < 0.9f) nearPixels += 1.0;
+            if (values[i] > 0.99f) farPixels += 1.0;
+        }
+    }
+    Check(foreground > 0.0, "depth_layers has foreground geometry");
+    Check(nearPixels / foreground >= 0.01, "depth_layers near <0.9 covers >=1%");
+    Check(farPixels / foreground >= 0.01, "depth_layers far >0.99 covers >=1%");
+    return true;
+}
+
+bool TestScreenCrossCoverage(Renderer& renderer)
+{
+    std::string error;
+    int positiveFrames = 0;
+    int negativeFrames = 0;
+    int largeFrames = 0;
+    double edgeMinimum = 1.0;
+    double edgeMaximum = 0.0;
+    double farGeometry = 0.0;
+    double staticFar = 0.0;
+    double previousNearX = 0.0;
+    bool hasPrevious = false;
+    bool continuous = true;
+
+    for (uint32_t frame = 4; frame <= 11; ++frame)
+    {
+        const FrameState state = MakeFrameState(SceneKind::ScreenCross, frame, false);
+        std::vector<uint8_t> depth;
+        std::vector<uint8_t> motion;
+        if (!renderer.Render(state, SceneKind::ScreenCross, false, error)
+            || !Readback(renderer.Depth(), depth, error)
+            || !Readback(renderer.Motion(), motion, error))
+        {
+            std::printf("FAIL: screen_cross frame %u: %s\n", frame, error.c_str());
+            return false;
+        }
+        if (!PreviousClipPositive(state, error))
+        {
+            std::printf("FAIL: screen_cross frame %u: %s\n", frame, error.c_str());
+            return false;
+        }
+
+        const float nearX = state.objects[0].world.m[12];
+        if (hasPrevious)
+        {
+            const float delta = std::fabs(nearX - previousNearX);
+            if (delta > 2.0f) continuous = false;
+        }
+        previousNearX = nearX;
+        hasPrevious = true;
+
+        const float* depthValues = reinterpret_cast<const float*>(depth.data());
+        const uint16_t* motionValues = reinterpret_cast<const uint16_t*>(motion.data());
+        double positive = 0.0;
+        double negative = 0.0;
+        double large = 0.0;
+        double edgePixels = 0.0;
+        double edgeMoving = 0.0;
+        for (uint32_t y = 0; y < kGeometryHeight; ++y)
+        {
+            for (uint32_t x = 0; x < kGeometryWidth; ++x)
+            {
+                const size_t index = static_cast<size_t>(y) * kGeometryWidth + x;
+                const float mvX = HalfToFloat(motionValues[index * 2 + 0]);
+                const float mvY = HalfToFloat(motionValues[index * 2 + 1]);
+                const double magnitude = std::sqrt(double(mvX) * mvX + double(mvY) * mvY);
+                if (mvX > 0.01f * kGeometryWidth) positive += 1.0;
+                if (mvX < -0.01f * kGeometryWidth) negative += 1.0;
+                if (magnitude > 0.02 * kGeometryWidth) large += 1.0;
+                if (depthValues[index] > 0.99f && depthValues[index] < 0.9999f)
+                {
+                    farGeometry += 1.0;
+                    if (magnitude < 0.5) staticFar += 1.0;
+                }
+                if (x < 2 || x >= kGeometryWidth - 2 || y < 2 || y >= kGeometryHeight - 2)
+                {
+                    edgePixels += 1.0;
+                    if (magnitude > 1.0) edgeMoving += 1.0;
+                }
+            }
+        }
+        if (positive >= 0.01 * kGeometryWidth * kGeometryHeight) ++positiveFrames;
+        if (negative >= 0.01 * kGeometryWidth * kGeometryHeight) ++negativeFrames;
+        if (large >= 0.01 * kGeometryWidth * kGeometryHeight) ++largeFrames;
+        const double edgeFraction = edgePixels > 0.0 ? edgeMoving / edgePixels : 0.0;
+        edgeMinimum = std::min(edgeMinimum, edgeFraction);
+        edgeMaximum = std::max(edgeMaximum, edgeFraction);
+    }
+
+    Check(continuous, "screen_cross horizontal trajectory is continuous");
+    Check(positiveFrames > 0, "screen_cross has +x dominant frames");
+    Check(negativeFrames > 0, "screen_cross has -x dominant frames");
+    Check(largeFrames > 0, "screen_cross has a frame with >=1% large motion");
+    Check(edgeMaximum - edgeMinimum >= 0.01,
+        "screen_cross moving-edge fraction changes by >=1%");
+    Check(farGeometry > 0.0 && staticFar / farGeometry >= 0.5,
+        "screen_cross has a static far background");
+    return true;
+}
+
+bool TestCameraTurnCoverage(Renderer& renderer)
+{
+    std::string error;
+    double nearPixels = 0.0;
+    double farPixels = 0.0;
+    double nearMotion = 0.0;
+    double farMotion = 0.0;
+    double broadMaximum = 0.0;
+
+    for (uint32_t frame = 0; frame < kTotalFrames; ++frame)
+    {
+        const FrameState state = MakeFrameState(SceneKind::CameraTurn, frame, false);
+        std::vector<uint8_t> depth;
+        std::vector<uint8_t> motion;
+        if (!renderer.Render(state, SceneKind::CameraTurn, false, error)
+            || !Readback(renderer.Depth(), depth, error)
+            || !Readback(renderer.Motion(), motion, error))
+        {
+            std::printf("FAIL: camera_turn frame %u: %s\n", frame, error.c_str());
+            return false;
+        }
+        if (!PreviousClipPositive(state, error))
+        {
+            std::printf("FAIL: camera_turn frame %u: %s\n", frame, error.c_str());
+            return false;
+        }
+
+        const float* depthValues = reinterpret_cast<const float*>(depth.data());
+        const uint16_t* motionValues = reinterpret_cast<const uint16_t*>(motion.data());
+        double foreground = 0.0;
+        double broad = 0.0;
+        for (size_t i = 0; i < size_t(kGeometryWidth) * kGeometryHeight; ++i)
+        {
+            const float mvX = HalfToFloat(motionValues[i * 2 + 0]);
+            const float mvY = HalfToFloat(motionValues[i * 2 + 1]);
+            const double normalized = std::sqrt(double(mvX) * mvX + double(mvY) * mvY)
+                / kGeometryWidth;
+            if (depthValues[i] < 0.9999f)
+            {
+                foreground += 1.0;
+                if (normalized > 0.005) broad += 1.0;
+            }
+            if (depthValues[i] < 0.97f)
+            {
+                nearPixels += 1.0;
+                nearMotion += normalized;
+            }
+            else if (depthValues[i] > 0.99f && depthValues[i] < 0.9999f)
+            {
+                farPixels += 1.0;
+                farMotion += normalized;
+            }
+        }
+        if (foreground > 0.0) broadMaximum = std::max(broadMaximum, broad / foreground);
+    }
+
+    Check(nearPixels > 0.0, "camera_turn near band depth <0.97 is nonempty");
+    Check(farPixels > 0.0, "camera_turn far band depth >0.99 is nonempty");
+    const double nearMean = nearPixels > 0.0 ? nearMotion / nearPixels : 0.0;
+    const double farMean = farPixels > 0.0 ? farMotion / farPixels : 0.0;
+    Check(nearMean - farMean >= 0.001, "camera_turn near/far mean motion gap >=0.001");
+    Check(broadMaximum > 0.30, "camera_turn broad motion covers >30% foreground");
+    return true;
+}
+
+BgraPixel ColorPixel(const std::vector<uint8_t>& color, uint32_t width, uint32_t x, uint32_t y)
+{
+    const size_t offset = (static_cast<size_t>(y) * width + x) * 4;
+    return {color[offset + 0], color[offset + 1], color[offset + 2], color[offset + 3]};
+}
+
+void CheckColorNear(const BgraPixel& pixel, float red, float green, float blue,
+    const std::string& message)
+{
+    const float tolerance = 0.04f * 255.0f;
+    Check(std::abs(float(pixel.r) - red * 255.0f) <= tolerance
+        && std::abs(float(pixel.g) - green * 255.0f) <= tolerance
+        && std::abs(float(pixel.b) - blue * 255.0f) <= tolerance
+        && pixel.a == 255,
+        message);
+}
+
+bool TestNonrigidRender(Renderer& renderer)
+{
+    std::string error;
+    const FrameState state = MakeFrameState(SceneKind::Nonrigid, 5, false);
+    std::vector<uint8_t> depth;
+    std::vector<uint8_t> motion;
+    if (!renderer.Render(state, SceneKind::Nonrigid, false, error)
+        || !Readback(renderer.Depth(), depth, error)
+        || !Readback(renderer.Motion(), motion, error))
+    {
+        std::printf("FAIL: nonrigid render/readback: %s\n", error.c_str());
+        return false;
+    }
+    const MotionStats motionStats = ComputeMotionStats(motion);
+    Check(motionStats.finite, "nonrigid motion finite");
+    Check(motionStats.nonZeroPixels > 500.0,
+        "nonrigid grid is visible and produces deformed motion");
+    Check(motionStats.maxMagnitude > 1.0, "nonrigid deformation produces real movement");
+    const DepthStats depthStats = ComputeDepthStats(depth);
+    Check(depthStats.finite && depthStats.inRange, "nonrigid depth finite and in range");
+    Check(depthStats.minimum < 0.99f && depthStats.maximum > 0.99f,
+        "nonrigid deforming panel and static background both contribute depth");
+    return true;
+}
+
+bool TestTransparencyRender(Renderer& renderer)
+{
+    std::string error;
+    const FrameState state = MakeFrameState(SceneKind::Transparency, 5, false);
+    std::vector<uint8_t> color;
+    std::vector<uint8_t> depth;
+    std::vector<uint8_t> motion;
+    if (!renderer.Render(state, SceneKind::Transparency, false, error)
+        || !Readback(renderer.Color(), color, error)
+        || !Readback(renderer.Depth(), depth, error)
+        || !Readback(renderer.Motion(), motion, error))
+    {
+        std::printf("FAIL: transparency render/readback: %s\n", error.c_str());
+        return false;
+    }
+    const MotionStats motionStats = ComputeMotionStats(motion);
+    Check(motionStats.finite && motionStats.maxMagnitude < 0.01,
+        "transparency geometry pass is opaque-only and static");
+
+    const float* values = reinterpret_cast<const float*>(depth.data());
+    size_t blockerPixels = 0;
+    size_t backdropPixels = 0;
+    for (size_t i = 0; i < depth.size() / sizeof(float); ++i)
+    {
+        if (values[i] < 0.975f) ++blockerPixels;
+        if (values[i] > 0.98f && values[i] < 0.9999f) ++backdropPixels;
+    }
+    const double total = double(depth.size() / sizeof(float));
+    Check(double(blockerPixels) / total > 0.05, "transparency blocker covers a distinct region");
+    Check(double(backdropPixels) / total > 0.50, "transparency opaque backdrop covers the frame");
+
+    // Independently computed premultiplied blend samples at frame 5.
+    CheckColorNear(ColorPixel(color, kColorWidth, 60, 60), 0.10f, 0.15f, 0.24f,
+        "transparency backdrop-only color");
+    CheckColorNear(ColorPixel(color, kColorWidth, 200, 80),
+        0.10f * 0.55f + 0.16f * 0.45f,
+        0.15f * 0.55f + 0.60f * 0.45f,
+        0.24f * 0.55f + 0.78f * 0.45f,
+        "transparency single-near blend color");
+    CheckColorNear(ColorPixel(color, kColorWidth, 200, 280),
+        0.10f * 0.45f + 0.80f * 0.55f,
+        0.15f * 0.45f + 0.22f * 0.55f,
+        0.24f * 0.45f + 0.18f * 0.55f,
+        "transparency single-far blend color");
+    CheckColorNear(ColorPixel(color, kColorWidth, 250, 180),
+        0.10f * 0.45f * 0.55f + 0.80f * 0.55f * 0.55f + 0.16f * 0.45f,
+        0.15f * 0.45f * 0.55f + 0.22f * 0.55f * 0.55f + 0.60f * 0.45f,
+        0.24f * 0.45f * 0.55f + 0.18f * 0.55f * 0.55f + 0.78f * 0.45f,
+        "transparency double-overlap blend color");
+    CheckColorNear(ColorPixel(color, kColorWidth, 499, 249), 0.20f, 0.24f, 0.26f,
+        "transparency blocker occludes both planes");
+    return true;
+}
+
 bool TestRenderSizeDimensions(Renderer& renderer640, ID3D12Device* device,
     ID3D12CommandQueue* queue, const std::filesystem::path& shader)
 {
@@ -737,7 +1256,11 @@ int main(int argc, char** argv)
     TestMatrixConventions();
     TestPairStates();
     TestSceneManifestSchema();
+    TestSceneExtensionManifest();
     TestRenderSizeTypes();
+    TestNewSceneNamesAndStates();
+    TestNonrigidContract();
+    TestTransparencyContract();
 
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
@@ -764,6 +1287,11 @@ int main(int argc, char** argv)
     for (size_t i = 0; i < kSceneCount; ++i)
         TestScene(renderer, static_cast<SceneKind>(i));
 
+    if (!TestDepthLayersCoverage(renderer)) return 1;
+    if (!TestScreenCrossCoverage(renderer)) return 1;
+    if (!TestCameraTurnCoverage(renderer)) return 1;
+    if (!TestNonrigidRender(renderer)) return 1;
+    if (!TestTransparencyRender(renderer)) return 1;
     if (!TestRenderSizeDimensions(renderer, device.Get(), queue.Get(), shader)) return 1;
 
     ComPtr<ID3D12InfoQueue> info;

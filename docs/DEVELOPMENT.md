@@ -14,6 +14,7 @@ This repository is the standalone XeFG 2x SDK extracted from
 | Tests | `tests/` |
 | Contracts and specifications | `docs/` |
 | Optional XefgProbe capture producer | `tools/capture/`, independently built with CMake |
+| Independent render validation | `tools/render-validation/`, outside the Python package |
 | Game injection/unlocking, wider experiments | external `MFG-Unlocker` project |
 
 This repository contains source only. It does not ship captures, ONNX models,
@@ -49,7 +50,7 @@ Run tests:
 python -I -B -m unittest discover -s tests -v
 ```
 
-Export a package from retained captures:
+Export a package from compatible captures:
 
 ```sh
 xefg-export --runs <capture-run-a>,<capture-run-b> --out <package-directory>
@@ -77,7 +78,8 @@ Synthetic tests need no captures. Integration tests use explicit fixture paths:
 | `XEFG_MODE4_CAPTURE` | Mode 4 with `application_inputs/`, for provenance |
 
 Unset variables skip the corresponding tests; invalid configured paths fail.
-See [Validation](VALIDATION.md) for results and fixture coverage.
+See [Validation](VALIDATION.md) for the test layers, commands, and the link to
+the measured render matrix.
 
 ## Optional native tool tests
 
@@ -95,6 +97,23 @@ The script tests use Windows PowerShell and command stubs; they do not build
 native code, run XeFG, or require a GPU. The scene test tests CPU data generation.
 See [Capture guide](CAPTURE_GUIDE.md) for the real capture/export sequence.
 
+## Independent render-validation tests
+
+The harness under `tools/render-validation/` is separate from the Python package
+and from the capture producer. It captures official presents, checks frame
+pairing, replays the same inputs through the SDK, and runs the native raster
+scenes. Build and capture commands are in the
+[render-validation README](../tools/render-validation/README.md).
+
+```sh
+python -I -B -m unittest discover -s tools/render-validation/tests -v
+ctest --test-dir <native-build-dir> -C Release --output-on-failure
+```
+
+A real matrix also needs the provider runtime, a frozen renderer, and a model
+package. Measured results are kept in the render-validation result set, not in
+this guide.
+
 ## Documentation map
 
 - [Quickstart](QUICKSTART.md): install, create application inputs, run examples.
@@ -103,8 +122,10 @@ See [Capture guide](CAPTURE_GUIDE.md) for the real capture/export sequence.
 - [Profiles](PROFILES.md): supported mode/size combinations, including mode-4 sizes.
 - [Capture guide](CAPTURE_GUIDE.md): optional Windows build, capture and export.
 - [Capture format](CAPTURE_FORMAT.md): capture/export contract revision 1.
-- [Compatibility](COMPATIBILITY.md): semantic scope, version history, and non-guarantees.
-- [Validation](VALIDATION.md): mode-4 results, current status, and historical source evidence.
+- [Compatibility](COMPATIBILITY.md): semantic scope, version history, sampler
+  precision, and non-guarantees.
+- [Validation](VALIDATION.md): testing layers, commands, and the measured matrix
+  link.
 
 ## Licensing
 

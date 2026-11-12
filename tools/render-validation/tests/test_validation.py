@@ -144,6 +144,48 @@ class InventoryTests(unittest.TestCase):
 
 
 class RenderCommandTests(unittest.TestCase):
+    def test_evidence_scenes_are_accepted_but_not_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            argv = ["validate.py", "render", "--renderer", "renderer.exe",
+                    "--out", str(root / "out"), "--scene", "nonrigid", "--render-only"]
+            with patch.object(validation.sys, "argv", argv), \
+                    patch.object(validation, "render_capture", return_value=0) as capture:
+                self.assertEqual(validation.main(), 0)
+            self.assertEqual(capture.call_args.args[0].scene, "nonrigid")
+        with patch.object(validation.sys, "argv",
+                          ["validate.py", "render", "--renderer", "r", "--out", "o",
+                           "--render-only"]), \
+                patch.object(validation, "render_capture", return_value=0) as capture:
+            self.assertEqual(validation.main(), 0)
+        self.assertEqual(capture.call_args.args[0].scene, "translation")
+
+    def test_tensor_capture_options_forwarded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            renderer = root / "renderer.exe"
+            renderer.write_bytes(b"fixture")
+            args = SimpleNamespace(out=root / "out", renderer=renderer, scene="nonrigid", frames=5,
+                                   pacing_ms=16, xess_bin=root, mode=3, pair_frame=None, size="640x360",
+                                   render_only=False, warp=False, debug=False, no_tag=False,
+                                   tensor_frame=8, tensor_budget_mb=1024)
+            with patch.object(validation.subprocess, "run") as run, patch.object(validation, "write_report",
+                    return_value={"status": "inventory_complete", "present_count": 5, "issues": []}):
+                self.assertEqual(validation.render_capture(args), 0)
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("--tensor-frame") + 1], "8")
+            self.assertEqual(command[command.index("--tensor-budget-mb") + 1], "1024")
+
+    def test_tensor_frame_rejects_invalid_scope(self):
+        base = ["validate.py", "render", "--renderer", "r", "--out", "o", "--frames", "5"]
+        for extra in (["--tensor-frame", "9"], ["--tensor-frame", "-1"],
+                      ["--tensor-frame", "8", "--render-only"],
+                      ["--tensor-frame", "8", "--tensor-budget-mb", "0"],
+                      ["--tensor-frame", "1", "--mode", "1", "--pair-frame", "8"]):
+            with patch.object(validation.sys, "argv", base + extra), \
+                    patch.object(validation.sys, "stderr"), self.assertRaises(SystemExit):
+                validation.main()
+
     def test_mode_and_isolated_source_frame_forwarded(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

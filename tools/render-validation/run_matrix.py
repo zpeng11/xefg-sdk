@@ -2,12 +2,15 @@
 import argparse
 import json
 import hashlib
+import importlib.util
 from pathlib import Path
 import subprocess
 import sys
 
 
 SCENES = ("translation", "occlusion", "camera", "cut")
+COVERAGE_SCENES = ("depth_layers", "screen_cross", "camera_turn", "nonrigid", "transparency")
+EXIT_CODES = {"pass": 0, "run_failed": 1, "quality_failed": 2, "coverage_failed": 3}
 
 
 SIZES = ("640x360", "1280x720", "1920x1080", "2560x1440", "3840x2160")
@@ -70,6 +73,11 @@ def run_case(args, directory, scene, mode, pair_frame=None, size="640x360"):
             # Only a successfully written inventory can explain reset warnings.
             if stage == "render" and process.returncode == 1 and (directory / "inventory/report.json").exists():
                 continue
+            if stage == "inputs" and process.returncode == 3 and (directory / "input-check.json").exists():
+                # Retain output comparisons even when the scene missed its coverage target.
+                inputs = json.loads((directory / "input-check.json").read_text(encoding="utf-8"))
+                if inputs.get("coverage", {}).get("status") == "fail":
+                    continue
             if stage == "quality" and process.returncode == 1 and (directory / "quality.json").exists():
                 gate = json.loads((directory / "quality.json").read_text(encoding="utf-8"))
                 if gate.get("schema") == "xefg.quality_gate/1" and any(
@@ -99,16 +107,33 @@ def run_case(args, directory, scene, mode, pair_frame=None, size="640x360"):
 def combined_status(rows):
     if any(row["status"] == "run_failed" for row in rows):
         return "run_failed"
+    if any(row["status"] == "coverage_failed" for row in rows):
+        return "coverage_failed"
     return "quality_failed" if any(row["status"] == "quality_failed" for row in rows) else "pass"
+
+
+def scene_coverage(scene, cases):
+    if scene not in COVERAGE_SCENES:
+        return {"status": "not_applicable"}
+    spec = importlib.util.spec_from_file_location("input_coverage", Path(__file__).with_name("check_render_inputs.py"))
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    frames = []
+    for case in cases:
+        path = Path(case["directory"]) / "input-check.json"
+        if not path.exists():
+            return {"status": "pending", "reason": "input report missing"}
+        frames.extend(json.loads(path.read_text(encoding="utf-8"))["frames"])
+    return tool.aggregate_coverage(scene, frames)
 
 
 def write_summary(output, report):
     (output / "matrix.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     lines = ["# Render validation matrix", "", f"Status: {report['status']}", "",
-             "| Size | Mode | Scene | Status | Measured frames | Worst MAE | Max channel | Worst >2 fraction |",
-             "|---|---|---|---|---:|---:|---:|---:|"]
+             "| Size | Mode | Scene | Status | Coverage | Measured frames | Worst MAE | Max channel | Worst >2 fraction |",
+             "|---|---|---|---|---|---:|---:|---:|---:|"]
     for row in report["scenes"]:
-        lines.append(f"| {row['size']} | {row['mode']} | {row['scene']} | {row['status']} | {row['generated_frames']} | "
+        lines.append(f"| {row['size']} | {row['mode']} | {row['scene']} | {row['status']} | {row['coverage']['status']} | {row['generated_frames']} | "
                      f"{row['max_frame_rgb_mae']} | {row['max_channel_error']} | {row['max_over_2_fraction']} |")
     lines += ["", "Byte-unit RGB metrics exclude only recorded official tags and any frame marker.",
               "Cut source frame 7 is skipped because history resets. See JSON for stage logs and source pairs."]
@@ -123,9 +148,10 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--modes", type=int, nargs="+", choices=(1, 3, 4), default=[3])
     parser.add_argument("--sizes", nargs="+", choices=SIZES, default=["640x360"])
+    parser.add_argument("--scenes", nargs="+", choices=SCENES + COVERAGE_SCENES, default=list(SCENES))
     args = parser.parse_args()
-    if len(set(args.modes)) != len(args.modes) or len(set(args.sizes)) != len(args.sizes):
-        parser.error("--modes and --sizes must not contain duplicates")
+    if any(len(set(values)) != len(values) for values in (args.modes, args.sizes, args.scenes)):
+        parser.error("--modes, --sizes and --scenes must not contain duplicates")
     output = args.out.resolve()
     if output.exists():
         raise FileExistsError(output)
@@ -135,7 +161,7 @@ def main():
     for size in args.sizes:
         root = output if args.sizes == ["640x360"] else output / size
         for mode in args.modes:
-            for scene in SCENES:
+            for scene in args.scenes:
                 directory = root / scene if args.sizes == ["640x360"] and args.modes == [3] else root / f"mode{mode}" / scene
                 skipped = [{"source_frame": 7, "reason": "camera cut resets history"}] if scene == "cut" else []
                 if mode == 1:
@@ -146,24 +172,29 @@ def main():
                 result = {"scene": scene, "mode": mode, "size": size, "status": combined_status(cases),
                           "completed": all(row["completed"] for row in cases), "cases": cases,
                           "skipped": skipped}
+                result["coverage"] = scene_coverage(scene, cases)
+                result["quality_status"] = result["status"]
+                if result["status"] != "run_failed" and result["coverage"]["status"] in ("fail", "pending"):
+                    result["status"] = "coverage_failed"
                 measured = [row for row in cases if row["completed"]]
                 result["generated_frames"] = sum(row["generated_frames"] for row in measured)
                 for key in ("max_frame_rgb_mae", "max_channel_error", "max_over_2_fraction"):
                     result[key] = max((row[key] for row in measured), default=None)
                 results.append(result)
-                expected = len(args.sizes) * len(args.modes) * len(SCENES)
+                expected = len(args.sizes) * len(args.modes) * len(args.scenes)
                 size_results = []
                 for completed_size in args.sizes:
                     rows = [row for row in results if row["size"] == completed_size]
                     size_results.append({"size": completed_size,
-                                         "status": combined_status(rows) if len(rows) == len(args.modes) * len(SCENES) else ("running" if rows else "pending"),
+                                         "status": combined_status(rows) if len(rows) == len(args.modes) * len(args.scenes) else ("running" if rows else "pending"),
                                          "generated_frames": sum(row["generated_frames"] for row in rows)})
-                report = {"schema": "xefg.render_matrix/3", "modes": args.modes, "sizes": args.sizes,
+                report = {"schema": "xefg.render_matrix/4", "modes": args.modes, "sizes": args.sizes,
+                          "requested_scenes": args.scenes,
                           "package_profiles": profiles, "size_results": size_results,
                           "status": combined_status(results) if len(results) == expected else "running",
-                          "scenes": results, "exit_codes": {"pass": 0, "run_failed": 1, "quality_failed": 2}}
+                          "scenes": results, "exit_codes": EXIT_CODES}
                 write_summary(output, report)
-    return {"pass": 0, "run_failed": 1, "quality_failed": 2}[combined_status(results)]
+    return EXIT_CODES[combined_status(results)]
 
 
 if __name__ == "__main__":
