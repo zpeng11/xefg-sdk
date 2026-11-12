@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location(
     "replay_matrix", Path(__file__).parents[1] / "replay_matrix.py")
@@ -215,6 +216,31 @@ class ImageSelectionTests(unittest.TestCase):
              "valid_region": {"rgb_mae": 0}})
         self.assertNotIn("output", row)
         self.assertEqual(row["artifact_retention"]["state"], "compacted")
+
+
+class CoverageAggregationTests(unittest.TestCase):
+    def test_coverage_status_controls_combo_status(self):
+        pairs = [{"source_current_frame": frame} for frame in range(4, 12)]
+        cases = [{"case": "capture", "label": "capture", "status": "pass",
+                  "pairs": pairs, "input_check": {"frames": []},
+                  "quality": {"failures": [], "warnings": []}}]
+        limits = {"mae": 0.015, "maximum": 40, "fraction": 0.0015}
+        for coverage_status, expected in (("pending", "coverage_failed"),
+                                          ("fail", "coverage_failed"),
+                                          ("pass", "pass"),
+                                          ("not_applicable", "pass")):
+            with self.subTest(coverage_status=coverage_status):
+                tool = mock.Mock()
+                tool.aggregate_coverage.return_value = {
+                    "status": coverage_status, "measured_frames": []}
+                with mock.patch.object(replay_matrix, "_load_tool", return_value=tool), \
+                        mock.patch.object(replay_matrix, "retain_images", return_value=[]):
+                    result = replay_matrix.aggregate_combo(
+                        "depth_layers__640x360__mode3", "depth_layers", "640x360",
+                        3, "existing", cases, Path("unused"), limits)
+                self.assertEqual(result["status"], expected)
+                self.assertEqual(result["coverage"]["status"], coverage_status)
+                self.assertEqual(result["quality"]["status"], "pass")
 
 
 class InputEvidenceTests(unittest.TestCase):

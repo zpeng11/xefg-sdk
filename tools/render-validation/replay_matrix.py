@@ -689,7 +689,7 @@ def aggregate_combo(key, scene, size, mode, source, case_results, out, limits):
     status = "pass"
     if errors:
         status = "run_failed"
-    elif coverage.get("status") == "fail":
+    elif coverage.get("status") in ("fail", "pending"):
         status = "coverage_failed"
     elif quality_failures:
         status = "quality_failed"
