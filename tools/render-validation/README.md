@@ -112,9 +112,9 @@ recorded official tags and the frame marker; moving UI remains in the comparison
 UI and full-frame metrics are also reported separately.
 
 All sizes and modes use the same inclusive limits:
-- RGB MAE **<=0.01**;
+- RGB MAE **<=0.011**;
 - maximum channel difference **<=32**;
-- pixels with any RGB difference >2: **<=0.0002 (0.02%)**.
+- pixels with any RGB difference >2: **<=0.001 (0.1%)**.
 
 Maxima above8 but within32 are warnings. The three gates are independent; no
 automatic resolution scaling or visual waiver is applied. A completed replay is

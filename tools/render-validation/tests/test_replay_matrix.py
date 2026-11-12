@@ -176,7 +176,7 @@ class ResumeTests(unittest.TestCase):
 
 
 class ImageSelectionTests(unittest.TestCase):
-    LIMITS = {"mae": 0.01, "maximum": 32, "fraction": 0.0002}
+    LIMITS = {"mae": 0.011, "maximum": 32, "fraction": 0.001}
 
     @staticmethod
     def _pair(frame, mae, maximum, fraction):

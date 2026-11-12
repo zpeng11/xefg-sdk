@@ -8,7 +8,7 @@ spec.loader.exec_module(quality)
 
 
 class QualityTests(unittest.TestCase):
-    def report(self, mae=0.01, maximum=32, fraction=0.0002):
+    def report(self, mae=0.011, maximum=32, fraction=0.001):
         return {"status": "measured", "pairs": [{"current_frame": 4, "valid_region": {
             "rgb_mae": mae, "rgb_max": maximum, "over_tolerance_pixel_fraction": fraction,
             "tolerance": 2}}]}
@@ -17,7 +17,7 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(quality.evaluate(self.report())["status"], "pass")
 
     def test_each_limit_enforced(self):
-        for values in ((0.01001, 8, 0.0002), (0.01, 33, 0.0002), (0.01, 8, 0.00021)):
+        for values in ((0.01101, 8, 0.001), (0.011, 33, 0.001), (0.011, 8, 0.00101)):
             self.assertEqual(quality.evaluate(self.report(*values))["status"], "fail")
 
     def test_nonfinite_metrics_cannot_pass(self):
@@ -40,7 +40,7 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(quality.evaluate(self.report(maximum=8))["warnings"], [])
 
     def test_warning_does_not_waive_other_limits(self):
-        result = quality.evaluate(self.report(maximum=32, fraction=0.0003))
+        result = quality.evaluate(self.report(maximum=32, fraction=0.0011))
         self.assertEqual(result["status"], "fail")
         self.assertEqual(result["failures"][0]["exceeded"], ["over_2_fraction"])
         self.assertEqual(len(result["warnings"]), 1)

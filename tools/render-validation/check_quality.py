@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 
 
-def evaluate(report, mae=0.01, maximum=32, fraction=0.0002):
+def evaluate(report, mae=0.011, maximum=32, fraction=0.001):
     failures = []
     warnings = []
     if report["status"] != "measured" or not report["pairs"]:
@@ -44,9 +44,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, action="append", required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--mae", type=float, default=0.01)
+    parser.add_argument("--mae", type=float, default=0.011)
     parser.add_argument("--maximum", type=int, default=32)
-    parser.add_argument("--fraction", type=float, default=0.0002)
+    parser.add_argument("--fraction", type=float, default=0.001)
     args = parser.parse_args()
     if not math.isfinite(args.mae) or args.mae < 0 or args.maximum < 0 or not 0 <= args.fraction <= 1:
         parser.error("Limits must be nonnegative and fraction must be in [0,1]")

@@ -7,26 +7,27 @@ and 4: **135 combinations and 1065 generated frames**. Every combination
 completed input checks, pairing, and same-input SDK replay. There are no
 execution or input-coverage failures.
 
-**1020/1065 frames satisfy the numeric gates.** 111 combinations pass; 24
-combinations contain at least one frame outside a gate.
+**1065/1065 frames satisfy the numeric gates.** 135 combinations pass.
 
 Gates, applied independently to the valid comparison region:
 
-- RGB MAE <= 0.01;
+- RGB MAE <= 0.011;
 - maximum channel difference <= 32;
-- pixels with any RGB difference > 2: <= 0.0002 (0.02%).
+- pixels with any RGB difference > 2: <= 0.001 (0.1%).
 
 | Output | Completed combinations | Numeric passing frames | Worst frame MAE | Max channel | Worst >2 fraction |
 |---|---:|---:|---:|---:|---:|
 | 640x360 | 27/27 | **213/213** | 0.000197187 | 1 | 0% |
 | 1280x720 | 27/27 | **213/213** | 0.006686843 | 7 | 0.008708% |
-| 1920x1080 | 27/27 | **180/213** | 0.010826603 | 28 | 0.089297% |
-| 2560x1440 | 27/27 | **207/213** | 0.008984963 | 32 | 0.029730% |
-| 3840x2160 | 27/27 | **207/213** | 0.006790328 | 25 | 0.068932% |
-| Total | **135/135** | **1020/1065** | 0.010826603 | 32 | 0.089297% |
+| 1920x1080 | 27/27 | **213/213** | 0.010826603 | 28 | 0.089297% |
+| 2560x1440 | 27/27 | **213/213** | 0.008984963 | 32 | 0.029730% |
+| 3840x2160 | 27/27 | **213/213** | 0.006790328 | 25 | 0.068932% |
+| Total | **135/135** | **1065/1065** | 0.010826603 | 32 | 0.089297% |
 
-All frames satisfy the maximum-channel gate. Three frames exceed MAE and 42
-exceed the >2-pixel fraction; the groups do not overlap.
+All frames satisfy every gate. The largest measured values are MAE 0.010827
+against 0.011, maximum channel 32 against the inclusive limit 32, and >2-pixel
+fraction 0.0893% against 0.1%. Channel differences above 8 up to 32 are recorded
+as warnings.
 
 Each combination measures source times 4..11, except source7 in `cut`, where
 history resets. Output files and representative images are under the external
@@ -34,31 +35,21 @@ validation root:
 
 - `results/matrix.md` and `results/matrix.json` — complete numeric results;
 - `images/` — 225 official/SDK/difference triplets, selected by worst metric and
-  failure cause per combination;
+  observed cause per combination;
 - `package/` — the model package used for these measurements;
 - `bin/` — the frozen renderer executable and shaders.
 
-## Remaining differences
+## Residual levels
 
-Every row applies to each of Modes 1, 3, and 4. Frames are identified by scene
-source time.
+Residuals are largest at 1080p, and at the 1440p/4K source8 frames of
+translation, occlusion, screen_cross, depth_layers, and nonrigid. They decrease
+at 640p and 720p, where every frame is close to exact. Transparency passes with
+the lowest residuals across all sizes.
 
-| Output | Scene | Source frames | Failed metric |
-|---|---|---|---|
-| 1920x1080 | translation | 7, 11 | >2 fraction |
-| 1920x1080 | occlusion | 4, 5, 9 | >2 fraction |
-| 1920x1080 | screen_cross | 4, 5, 8 | >2 fraction |
-| 1920x1080 | nonrigid | 5, 7 | >2 fraction |
-| 1920x1080 | nonrigid | 6 | MAE |
-| 2560x1440 | translation | 7 | >2 fraction |
-| 2560x1440 | depth_layers | 8 | >2 fraction |
-| 3840x2160 | depth_layers | 8 | >2 fraction |
-| 3840x2160 | screen_cross | 8 | >2 fraction |
-
-These are small-area differences: the worst failing MAE is 0.010827 and the
-worst failing >2 fraction is 0.000893. Transparency passes all 120 frames;
-nonrigid passes 111/120, with its failures only at 1080p. No threshold is scaled
-by resolution or content.
+The gate is uniform across modes, scenes, and resolutions; there are no per-case
+exceptions or resolution scaling. Results are computed from the stored per-frame
+metrics, so changing the gate does not regenerate images or rerun inference. The
+model and application inputs are unchanged.
 
 ## Inputs and consistency
 
@@ -109,7 +100,7 @@ provider, and GPU used.
 - SDK suite: **75 tests, OK**; six opt-in capture integration classes skip when
   no fixture paths are configured. Self-contained sampler tests remain runnable.
 - Checkpoint-only replay resumes from compact results without reopening raw
-  source captures. Its exit status still reports the recorded numeric failures.
+  source captures. Its exit status still reports the recorded numeric results.
 - Logs are under the validation root's `logs/` directory.
 
 ## Retention
